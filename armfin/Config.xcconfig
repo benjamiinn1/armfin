@@ -1,0 +1,12 @@
+// Shared build configuration for armfin.
+// Includes local developer settings (gitignored) for team/bundle ID overrides.
+
+// Fallback defaults when LocalDeveloperSettings.xcconfig is missing.
+// The project will open without errors, but signing will fail until the
+// developer creates their own LocalDeveloperSettings.xcconfig.
+DEVELOPMENT_TEAM =
+APP_BUNDLE_IDENTIFIER = com.example.armfin
+WATCHAPP_BUNDLE_IDENTIFIER = com.example.armfin.watchkitapp
+
+// Local overrides (last assignment wins in xcconfig).
+#include? "LocalDeveloperSettings.xcconfig"

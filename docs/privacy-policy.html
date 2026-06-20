@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>armfin — Privacy Policy</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+            background: #000;
+            color: #f5f5f7;
+            line-height: 1.6;
+            padding: 2rem 1.5rem;
+            max-width: 680px;
+            margin: 0 auto;
+        }
+        h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+            letter-spacing: -0.02em;
+        }
+        .subtitle {
+            color: #86868b;
+            font-size: 0.95rem;
+            margin-bottom: 2.5rem;
+        }
+        h2 {
+            font-size: 1.15rem;
+            font-weight: 600;
+            margin-top: 2rem;
+            margin-bottom: 0.5rem;
+        }
+        p, li {
+            color: #d1d1d6;
+            font-size: 0.95rem;
+            margin-bottom: 0.75rem;
+        }
+        ul {
+            padding-left: 1.25rem;
+            margin-bottom: 0.75rem;
+        }
+        li { margin-bottom: 0.35rem; }
+        a { color: #2997ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .footer {
+            margin-top: 3rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid #1d1d1f;
+            color: #86868b;
+            font-size: 0.8rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>Privacy Policy</h1>
+    <p class="subtitle">armfin for Apple Watch</p>
+
+    <p>armfin is a free, open-source watchOS application that connects directly to your personal Jellyfin media server. Your privacy is fundamental to how this app is built.</p>
+
+    <h2>Data Collection</h2>
+    <p>armfin does <strong>not</strong> collect, store, transmit, or share any personal data, usage analytics, crash reports, or telemetry of any kind. There are no trackers, no third-party SDKs, and no network calls to any server other than the Jellyfin server you configure yourself.</p>
+
+    <h2>What Stays on Your Device</h2>
+    <ul>
+        <li><strong>Server credentials</strong> — Your Jellyfin server URL, user ID, and access token are stored exclusively in the Apple Watch Keychain on your device. They are never transmitted anywhere except to your own Jellyfin server for authentication.</li>
+        <li><strong>Cached library data</strong> — Artist, album, and track metadata fetched from your server is cached locally on the watch for performance. This data never leaves your device.</li>
+        <li><strong>Downloaded audio files</strong> — Tracks you choose to download are stored in the app's private sandboxed storage on the watch. They are never uploaded, shared, or accessible to any other app.</li>
+    </ul>
+
+    <h2>Network Communication</h2>
+    <p>The only network connections armfin makes are directly to the Jellyfin server URL you provide during setup. All communication uses your server's own API endpoints for authentication, browsing your library, streaming audio, and downloading tracks. No data is routed through any intermediary, cloud service, or third party.</p>
+
+    <h2>No Accounts or Registration</h2>
+    <p>armfin does not require or offer any account registration, sign-up, or login beyond your existing Jellyfin server credentials. There is no armfin account, no email collection, and no user profiles.</p>
+
+    <h2>No Advertising or Monetization</h2>
+    <p>armfin contains no advertisements, in-app purchases, paywalls, or any form of monetization. There are no ad-tracking SDKs or identifiers.</p>
+
+    <h2>Children's Privacy</h2>
+    <p>armfin does not collect any data from any user, including children. The app connects only to a user-configured private server and stores all information locally on the device.</p>
+
+    <h2>Open Source</h2>
+    <p>armfin is fully open source. You can inspect the entire codebase to verify these claims at <a href="https://github.com/benjamiinn1/armfin">github.com/benjamiinn1/armfin</a>.</p>
+
+    <h2>Changes to This Policy</h2>
+    <p>If this policy is ever updated, the changes will be posted on this page with an updated effective date. Given armfin's zero-data-collection design, material changes are unlikely.</p>
+
+    <h2>Contact</h2>
+    <p>If you have questions about this privacy policy, you can open an issue on the <a href="https://github.com/benjamiinn1/armfin/issues">GitHub repository</a>.</p>
+
+    <div class="footer">
+        <p>Effective date: June 21, 2026</p>
+        <p>&copy; 2026 armfin contributors. This app is provided free and open source under the terms of its license.</p>
+    </div>
+</body>
+</html>

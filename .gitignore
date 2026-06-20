@@ -1,0 +1,77 @@
+# Xcode
+#
+build/
+DerivedData/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+
+# Xcode automatically generates this directory and file when you build/run from Xcode
+*.xcuserstate
+
+# Obj-C/Swift specific
+.build/
+*.hmap
+
+# Swift Package Manager
+#
+.swiftpm/
+Packages/
+Package.pins
+Package.resolved
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+!*.xcworkspace/contents.xcworkspacedata
+/*.gcno
+
+# CocoaPods
+#
+Pods/
+
+# Carthage
+#
+Carthage/Build/
+
+# fastlane
+#
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# Code coverage
+*.profraw
+*.profdata
+
+# watchOS / device pairing & provisioning
+*.mobileprovision
+*.cer
+*.p12
+
+# macOS
+.DS_Store
+
+# Crashlytics / dSYMs
+*.dSYM.zip
+*.dSYM
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+
+# Cursor IDE
+.cursor/
+
+# Local developer settings (contains team ID, bundle IDs)
+armfin/LocalDeveloperSettings.xcconfig
