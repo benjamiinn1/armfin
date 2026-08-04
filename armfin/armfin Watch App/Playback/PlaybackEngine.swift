@@ -181,26 +181,51 @@ final class PlaybackEngine {
         try session.setCategory(.playback, mode: .default, policy: .longFormAudio, options: [])
     }
 
+    /// Bounded watchdog for the async `AVAudioSession.activate()` call below.
+    /// That call negotiates Bluetooth/route selection on watchOS and can, in
+    /// practice, stall indefinitely (observed: a shuffled downloaded track
+    /// stuck in `.loadingItem` forever with no failure state, resolved only
+    /// once a subsequent `play()` attempt happened to land after the stall
+    /// cleared). Unlike `asset.load(.isPlayable)`, this await previously had
+    /// no timeout at all — this is what actually bounds it. On timeout we
+    /// fall through to the same synchronous `setActive(true)` fallback used
+    /// for a thrown error, rather than failing the track outright, since that
+    /// fallback is already relied on elsewhere (post-interruption resume).
+    private static let activationWatchdogTimeout: TimeInterval = 6
+
     /// Activates the audio session using the async watchOS `activate()` method
     /// which handles Bluetooth route selection. Must be called before first
     /// playback. Subsequent calls are no-ops if already activated.
     /// Returns `true` if a valid audio route is available.
     func activateAudioSession() async -> Bool {
         guard !isAudioSessionActivated else { return true }
+
         do {
             try configureAudioSessionCategory()
-            try await AVAudioSession.sharedInstance().activate()
+        } catch {
+        }
+
+        let activated = await raceAgainstWatchdog(timeout: Self.activationWatchdogTimeout, timeoutValue: false) {
+            do {
+                try await AVAudioSession.sharedInstance().activate()
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        if activated {
+            isAudioSessionActivated = true
+            return true
+        }
+
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
             isAudioSessionActivated = true
             return true
         } catch {
-            do {
-                try AVAudioSession.sharedInstance().setActive(true)
-                isAudioSessionActivated = true
-                return true
-            } catch {
-                isAudioSessionActivated = false
-                return false
-            }
+            isAudioSessionActivated = false
+            return false
         }
     }
 
@@ -445,7 +470,7 @@ final class PlaybackEngine {
             let injectedDelay = 0.0
             #endif
 
-            let outcome = await raceAgainstWatchdog(timeout: Self.loadWatchdogTimeout) {
+            let outcome = await raceAgainstWatchdog(timeout: Self.loadWatchdogTimeout, timeoutValue: .timedOut) {
                 if injectedDelay > 0 {
                     try? await Task.sleep(for: .seconds(injectedDelay))
                 }
@@ -496,11 +521,12 @@ final class PlaybackEngine {
     /// guarantee `asset.load` halts immediately on cancellation —
     /// `asset.cancelLoading()` at the call site is what actually stops the
     /// AVFoundation-side work.
-    private func raceAgainstWatchdog(
+    private func raceAgainstWatchdog<T: Sendable>(
         timeout: TimeInterval,
-        operation: @escaping @MainActor () async -> LoadOutcome
-    ) async -> LoadOutcome {
-        await withCheckedContinuation { (continuation: CheckedContinuation<LoadOutcome, Never>) in
+        timeoutValue: T,
+        operation: @escaping @MainActor () async -> T
+    ) async -> T {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
             let hasResumed = MainActorFlag()
 
             let loadTask = Task { @MainActor in
@@ -515,7 +541,7 @@ final class PlaybackEngine {
                 guard !hasResumed.value else { return }
                 hasResumed.value = true
                 loadTask.cancel()
-                continuation.resume(returning: .timedOut)
+                continuation.resume(returning: timeoutValue)
             }
         }
     }

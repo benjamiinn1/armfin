@@ -8,10 +8,11 @@
 //  `KeychainStore` and inserts a `ServerConfiguration` row into the
 //  SwiftData `ModelContext` supplied by the caller.
 //
-//  No `Timer`/polling/timeout is used anywhere here: watchOS text entry can
-//  involve scribble, dictation, or wrist-to-iPhone keyboard handoff, all of
-//  which can legitimately take longer than on-device typing, so the model
-//  never races the user's input against a clock (§2.6).
+//  Text entry itself never races a clock: watchOS text entry can involve
+//  scribble, dictation, or wrist-to-iPhone keyboard handoff, all of which can
+//  legitimately take longer than on-device typing (§2.6). The one exception
+//  to "no polling" (soul.md §2.1) is the bounded Quick Connect loop in
+//  `runQuickConnectFlow` — see its doc comment for the justification.
 //
 
 import Foundation
@@ -29,6 +30,8 @@ final class LoginViewModel {
         case validatingServer
         case serverValidated
         case authenticating
+        case quickConnectStarting
+        case quickConnectAwaitingApproval(code: String)
         case signedIn(AuthSession)
         case failed(LoginError)
     }
@@ -50,6 +53,8 @@ final class LoginViewModel {
         case serverUnreachable
         case httpNotAllowedForPublicHost
         case invalidCredentials
+        case quickConnectUnavailable
+        case quickConnectTimedOut
         case unknown
 
         var message: String {
@@ -60,6 +65,10 @@ final class LoginViewModel {
                 return "Remote servers require https://. Update the URL or use a VPN for local access."
             case .invalidCredentials:
                 return "Incorrect username or password"
+            case .quickConnectUnavailable:
+                return "Quick Connect isn't available on this server"
+            case .quickConnectTimedOut:
+                return "Quick Connect code expired. Try again."
             case .unknown:
                 return "Something went wrong. Please try again."
             }
@@ -80,7 +89,7 @@ final class LoginViewModel {
     /// `serverURL` — `LoginView` gates the username/password fields on this.
     var isServerValidated: Bool {
         switch phase {
-        case .serverValidated, .authenticating, .signedIn:
+        case .serverValidated, .authenticating, .quickConnectStarting, .quickConnectAwaitingApproval, .signedIn:
             return true
         case .failed:
             // Once credentials are rejected, the server itself is still
@@ -93,7 +102,12 @@ final class LoginViewModel {
     }
 
     var isBusy: Bool {
-        phase == .validatingServer || phase == .authenticating
+        switch phase {
+        case .validatingServer, .authenticating, .quickConnectStarting, .quickConnectAwaitingApproval:
+            return true
+        default:
+            return false
+        }
     }
 
     var errorMessage: String? {
@@ -103,10 +117,27 @@ final class LoginViewModel {
         return nil
     }
 
+    /// The Quick Connect code to display while awaiting approval, or `nil`
+    /// outside that phase. `LoginView` swaps in the pending-approval UI when
+    /// this is non-nil.
+    var quickConnectCode: String? {
+        if case let .quickConnectAwaitingApproval(code) = phase {
+            return code
+        }
+        return nil
+    }
+
     /// The server URL that last passed validation, used to detect whether
     /// the user has edited the field since validating (which should require
     /// re-validation before exposing credential fields again).
     private var lastValidatedServerURL: String?
+
+    /// The in-flight Quick Connect poll loop, if any. Stored so
+    /// `cancelQuickConnect()` and `signOut`/`resetServerValidation` can tear
+    /// it down deterministically — this is the one exception to soul.md
+    /// §2.1's "no polling" rule (see `runQuickConnectFlow`), so it must never
+    /// outlive the screen that started it.
+    private var quickConnectPollTask: Task<Void, Never>?
 
     // MARK: - Dependencies
 
@@ -186,36 +217,9 @@ final class LoginViewModel {
                 password: enteredPassword
             )
 
-            try keychainStore.save(
-                serverURL: trimmedURL,
-                userId: result.userId,
-                accessToken: result.accessToken
-            )
-
+            let session = try persistAuthenticationResult(result, serverURL: trimmedURL, context: context)
             password = ""
-
-            let existingDescriptor = FetchDescriptor<ServerConfiguration>()
-            if let existing = try? context.fetch(existingDescriptor) {
-                for old in existing {
-                    context.delete(old)
-                }
-            }
-
-            let configuration = ServerConfiguration(
-                serverURL: trimmedURL,
-                userId: result.userId,
-                username: result.username,
-                serverName: serverNameFallback(forServerURL: trimmedURL)
-            )
-            context.insert(configuration)
-
-            phase = .signedIn(
-                AuthSession(
-                    serverURL: trimmedURL,
-                    userId: result.userId,
-                    accessToken: result.accessToken
-                )
-            )
+            phase = .signedIn(session)
         } catch let error as JellyfinAPIClientError {
             phase = .failed(loginError(for: error))
         } catch {
@@ -224,12 +228,152 @@ final class LoginViewModel {
         }
     }
 
+    // MARK: - Quick Connect
+
+    /// Poll cadence and hard cap for `runQuickConnectFlow`: 2s between polls,
+    /// 150 attempts (~5 minutes total) — matching Jellyfin's own server-side
+    /// Quick Connect code expiry window, so the watch never polls longer
+    /// than the code could possibly still be valid.
+    private static let quickConnectPollInterval: Duration = .seconds(2)
+    private static let quickConnectMaxAttempts = 150
+
+    /// Starts the Quick Connect flow: requests a code from the validated
+    /// server, displays it, then polls for approval. This is the one place
+    /// in `LoginViewModel` that polls an endpoint — see the type-level note
+    /// on `quickConnectPollTask` for why this is a bounded exception to
+    /// soul.md §2.1 rather than a violation of it. The poll loop runs only
+    /// while this screen is visible: `LoginView` cancels it `onDisappear`.
+    @MainActor
+    func startQuickConnect(context: ModelContext) {
+        guard isServerValidated, quickConnectPollTask == nil else { return }
+
+        let trimmedURL = lastValidatedServerURL ?? Self.normalizeServerURL(serverURL)
+        phase = .quickConnectStarting
+
+        quickConnectPollTask = Task { [weak self] in
+            await self?.runQuickConnectFlow(serverURL: trimmedURL, context: context)
+        }
+    }
+
+    /// Cancels any in-flight Quick Connect poll loop and, if the phase was
+    /// still mid-flow, drops back to `.serverValidated` so the credential
+    /// fields reappear. Safe to call even when no Quick Connect flow is
+    /// active.
+    @MainActor
+    func cancelQuickConnect() {
+        quickConnectPollTask?.cancel()
+        quickConnectPollTask = nil
+
+        switch phase {
+        case .quickConnectStarting, .quickConnectAwaitingApproval:
+            phase = .serverValidated
+        default:
+            break
+        }
+    }
+
+    /// Requests a Quick Connect code, then polls `/QuickConnect/Connect`
+    /// on a fixed 2s cadence up to `quickConnectMaxAttempts` times. Bails
+    /// out immediately on cancellation (via `Task.checkCancellation()`),
+    /// which `cancelQuickConnect()` triggers. On approval, exchanges the
+    /// secret for a token and persists it exactly like `signIn`.
+    @MainActor
+    private func runQuickConnectFlow(serverURL: String, context: ModelContext) async {
+        do {
+            let initiated = try await apiClient.initiateQuickConnect(serverURL: serverURL)
+            phase = .quickConnectAwaitingApproval(code: initiated.code)
+
+            for _ in 0..<Self.quickConnectMaxAttempts {
+                try Task.checkCancellation()
+                try await Task.sleep(for: Self.quickConnectPollInterval)
+                try Task.checkCancellation()
+
+                let approved = try await apiClient.checkQuickConnectApproved(
+                    serverURL: serverURL,
+                    secret: initiated.secret
+                )
+                if approved {
+                    let result = try await apiClient.authenticateWithQuickConnect(
+                        serverURL: serverURL,
+                        secret: initiated.secret
+                    )
+                    let session = try persistAuthenticationResult(result, serverURL: serverURL, context: context)
+                    phase = .signedIn(session)
+                    quickConnectPollTask = nil
+                    return
+                }
+            }
+
+            phase = .failed(.quickConnectTimedOut)
+        } catch is CancellationError {
+            // `cancelQuickConnect()` already reset `phase`; nothing to do.
+        } catch let error as JellyfinAPIClientError {
+            phase = .failed(quickConnectError(for: error))
+        } catch {
+            phase = .failed(.unknown)
+        }
+
+        quickConnectPollTask = nil
+    }
+
+    /// Maps a thrown `JellyfinAPIClientError` from the Quick Connect calls to
+    /// the appropriate `LoginError`. Unlike `loginError(for:)`, a 401/403
+    /// here means the server has Quick Connect disabled, not "bad
+    /// credentials" — there are no credentials in this flow.
+    private func quickConnectError(for error: JellyfinAPIClientError) -> LoginError {
+        switch error {
+        case .unexpectedStatusCode(401), .unexpectedStatusCode(403):
+            return .quickConnectUnavailable
+        case .invalidURL, .requestFailed, .unexpectedStatusCode:
+            return .serverUnreachable
+        case .decodingFailed, .musicLibraryNotFound:
+            return .unknown
+        }
+    }
+
+    /// Shared by `signIn` and `runQuickConnectFlow`: persists the token to
+    /// the Keychain and replaces any existing `ServerConfiguration` row —
+    /// the app supports exactly one configured server at a time (§2.5).
+    /// Kept in one place per soul.md §4.1 rather than duplicated per
+    /// sign-in method.
+    @MainActor
+    private func persistAuthenticationResult(
+        _ result: JellyfinAPIClient.AuthenticationResult,
+        serverURL: String,
+        context: ModelContext
+    ) throws -> AuthSession {
+        try keychainStore.save(
+            serverURL: serverURL,
+            userId: result.userId,
+            accessToken: result.accessToken
+        )
+
+        let existingDescriptor = FetchDescriptor<ServerConfiguration>()
+        if let existing = try? context.fetch(existingDescriptor) {
+            for old in existing {
+                context.delete(old)
+            }
+        }
+
+        let configuration = ServerConfiguration(
+            serverURL: serverURL,
+            userId: result.userId,
+            username: result.username,
+            serverName: serverNameFallback(forServerURL: serverURL)
+        )
+        context.insert(configuration)
+
+        return AuthSession(serverURL: serverURL, userId: result.userId, accessToken: result.accessToken)
+    }
+
     // MARK: - Server re-edit
 
     /// Drops back to idle so the user can change the server URL without
     /// clearing credentials they've already typed.
     @MainActor
     func resetServerValidation() {
+        quickConnectPollTask?.cancel()
+        quickConnectPollTask = nil
         lastValidatedServerURL = nil
         phase = .idle
     }
@@ -238,6 +382,8 @@ final class LoginViewModel {
 
     @MainActor
     func signOut(context: ModelContext? = nil) {
+        quickConnectPollTask?.cancel()
+        quickConnectPollTask = nil
         try? keychainStore.delete()
 
         if let context {

@@ -293,34 +293,59 @@ struct LoginView: View {
                         .buttonStyle(.plain)
                     }
 
-                    TextField("Username", text: $viewModel.username)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
-                        .disabled(viewModel.isBusy)
-                        .focused($focusedField, equals: .username)
-                        .submitLabel(.next)
-                        .onSubmit { focusedField = .password }
-
-                    SecureField("Password", text: $viewModel.password)
-                        .disabled(viewModel.isBusy)
-                        .focused($focusedField, equals: .password)
-                        .submitLabel(.go)
-                        .onSubmit {
-                            Task { await viewModel.signIn(context: modelContext) }
+                    if let code = viewModel.quickConnectCode {
+                        quickConnectPendingView(code: code)
+                    } else if viewModel.phase == .quickConnectStarting {
+                        ProgressView("Requesting code…")
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        Button {
+                            viewModel.startQuickConnect(context: modelContext)
+                        } label: {
+                            Text("Quick Connect")
+                                .font(.footnote)
+                                .fontWeight(.medium)
+                                .foregroundStyle(.black)
+                                .frame(maxWidth: .infinity, minHeight: 44)
+                                .background(.white, in: RoundedRectangle(cornerRadius: 12))
                         }
+                        .buttonStyle(.plain)
+                        .disabled(viewModel.isBusy)
 
-                    Button {
-                        Task { await viewModel.signIn(context: modelContext) }
-                    } label: {
-                        Text("Sign In")
-                            .font(.footnote)
-                            .fontWeight(.medium)
-                            .foregroundStyle(.black)
-                            .frame(maxWidth: .infinity, minHeight: 44)
-                            .background(.white, in: RoundedRectangle(cornerRadius: 12))
+                        Text("or sign in with username & password")
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.5))
+                            .frame(maxWidth: .infinity, alignment: .center)
+
+                        TextField("Username", text: $viewModel.username)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled(true)
+                            .disabled(viewModel.isBusy)
+                            .focused($focusedField, equals: .username)
+                            .submitLabel(.next)
+                            .onSubmit { focusedField = .password }
+
+                        SecureField("Password", text: $viewModel.password)
+                            .disabled(viewModel.isBusy)
+                            .focused($focusedField, equals: .password)
+                            .submitLabel(.go)
+                            .onSubmit {
+                                Task { await viewModel.signIn(context: modelContext) }
+                            }
+
+                        Button {
+                            Task { await viewModel.signIn(context: modelContext) }
+                        } label: {
+                            Text("Sign In")
+                                .font(.footnote)
+                                .fontWeight(.medium)
+                                .foregroundStyle(.black)
+                                .frame(maxWidth: .infinity, minHeight: 44)
+                                .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(viewModel.username.isEmpty || viewModel.isBusy)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(viewModel.username.isEmpty || viewModel.isBusy)
                 } else {
                     Button {
                         Task {
@@ -356,6 +381,43 @@ struct LoginView: View {
             .padding(.vertical, 4)
         }
         .scrollContentBackground(.hidden)
+        .onDisappear {
+            // Tears down the Quick Connect poll loop the moment this screen
+            // isn't visible — including the success path, which navigates
+            // away via `navigationDestination`. Required so the bounded
+            // poll (LoginViewModel.runQuickConnectFlow) never outlives the
+            // screen that started it, per soul.md §2.1.
+            viewModel.cancelQuickConnect()
+        }
+    }
+
+    // MARK: - Quick Connect pending view
+
+    private func quickConnectPendingView(code: String) -> some View {
+        VStack(spacing: 8) {
+            Text(code)
+                .font(.system(.title2, design: .monospaced, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+
+            Text("Enter this code in Jellyfin on another device")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.6))
+                .multilineTextAlignment(.center)
+
+            ProgressView()
+
+            Button {
+                viewModel.cancelQuickConnect()
+            } label: {
+                Text("Cancel")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.7))
+                    .frame(maxWidth: .infinity, minHeight: 44)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 4)
     }
 
     // MARK: - Downloads page (right swipe)

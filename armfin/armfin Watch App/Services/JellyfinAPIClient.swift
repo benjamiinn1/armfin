@@ -383,6 +383,105 @@ struct JellyfinAPIClient: Sendable {
         )
     }
 
+    // MARK: - Quick Connect
+
+    /// Decoded `QuickConnectResult` shape returned by both
+    /// `/QuickConnect/Initiate` and `/QuickConnect/Connect` (§2.7):
+    /// ```json
+    /// { "Authenticated": false, "Secret": "...", "Code": "ABC123", "DateAdded": "..." }
+    /// ```
+    private struct QuickConnectResultPayload: Decodable {
+        let authenticated: Bool
+        let secret: String
+        let code: String
+
+        enum CodingKeys: String, CodingKey {
+            case authenticated = "Authenticated"
+            case secret = "Secret"
+            case code = "Code"
+        }
+    }
+
+    /// Public result of `initiateQuickConnect`, decoupled from the private
+    /// wire-format struct above the same way `AuthenticationResult` decouples
+    /// from `AuthenticateByNameResponse`.
+    struct QuickConnectInitiateResult: Equatable, Sendable {
+        let code: String
+        let secret: String
+    }
+
+    /// Performs `POST {serverURL}/QuickConnect/Initiate` (§2.7). No
+    /// authorization header/token is required or sent — this is a pre-auth
+    /// call, same as `validateServer`. Returns the user-facing `code` to
+    /// display and the `secret` used to poll/exchange for a token.
+    ///
+    /// The server responds with `401` when Quick Connect is disabled for
+    /// this server, surfaced here as `.unexpectedStatusCode(401)` — callers
+    /// map that to a "Quick Connect unavailable" message rather than this
+    /// client pre-checking `/QuickConnect/Enabled` separately.
+    func initiateQuickConnect(serverURL: String) async throws -> QuickConnectInitiateResult {
+        let url = try endpointURL(serverURL: serverURL, path: "/QuickConnect/Initiate")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        applyCommonHeaders(to: &request, accessToken: nil)
+
+        let data = try await perform(request)
+        let response = try decode(QuickConnectResultPayload.self, from: data)
+
+        return QuickConnectInitiateResult(code: response.code, secret: response.secret)
+    }
+
+    /// Performs `GET {serverURL}/QuickConnect/Connect?secret=<secret>` (§2.7)
+    /// — a single poll attempt, not a loop. Callers are responsible for the
+    /// bounded retry cadence (see `LoginViewModel.runQuickConnectFlow`).
+    /// Returns `true` once the code has been approved from another device.
+    func checkQuickConnectApproved(serverURL: String, secret: String) async throws -> Bool {
+        let url = try endpointURL(serverURL: serverURL, path: "/QuickConnect/Connect")
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "secret", value: secret)]
+
+        guard let finalURL = components?.url else {
+            throw JellyfinAPIClientError.invalidURL
+        }
+
+        var request = URLRequest(url: finalURL)
+        request.httpMethod = "GET"
+        applyCommonHeaders(to: &request, accessToken: nil)
+
+        let data = try await perform(request)
+        let response = try decode(QuickConnectResultPayload.self, from: data)
+        return response.authenticated
+    }
+
+    /// Performs `POST {serverURL}/Users/AuthenticateWithQuickConnect` with
+    /// body `{"Secret": secret}` (§2.7) once `checkQuickConnectApproved` has
+    /// reported `true`. The server returns the exact same `AuthenticationResult`
+    /// shape as `/Users/AuthenticateByName`, so this reuses
+    /// `AuthenticateByNameResponse` for decoding rather than duplicating it.
+    func authenticateWithQuickConnect(serverURL: String, secret: String) async throws -> AuthenticationResult {
+        let url = try endpointURL(serverURL: serverURL, path: "/Users/AuthenticateWithQuickConnect")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyCommonHeaders(to: &request, accessToken: nil)
+
+        let body = ["Secret": secret]
+        guard let bodyData = try? JSONEncoder().encode(body) else {
+            throw JellyfinAPIClientError.decodingFailed
+        }
+        request.httpBody = bodyData
+
+        let data = try await perform(request)
+        let response = try decode(AuthenticateByNameResponse.self, from: data)
+
+        return AuthenticationResult(
+            userId: response.user.id,
+            username: response.user.name,
+            accessToken: response.accessToken,
+            serverId: response.serverId
+        )
+    }
+
     // MARK: - Music library discovery
 
     /// Performs `GET {serverURL}/Users/{userId}/Views` to discover the

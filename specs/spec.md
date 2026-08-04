@@ -328,6 +328,9 @@ Two deliberately separate `URLSession` stacks — they cannot be merged because 
 | Adaptive/transcoded stream | GET | `/Audio/{Id}/universal` | `audioCodec`, `maxStreamingBitrate`, `container`, `transcodingContainer`, `api_key` |
 | Background download | GET | `/Audio/{Id}/stream` | same as direct-play, fetched via `URLSessionDownloadTask` instead of played in place |
 | Artwork | GET | `/Items/{Id}/Images/Primary` | `tag=<imageTag>`, `maxWidth=<px>` (size appropriately for watch screen — request at 1x/2x display points, never full-resolution server art) |
+| Quick Connect: initiate | POST | `/QuickConnect/Initiate` | none, no auth (401 if disabled server-side) |
+| Quick Connect: poll | GET | `/QuickConnect/Connect` | `secret=<secret>` |
+| Quick Connect: exchange | POST | `/Users/AuthenticateWithQuickConnect` | body: `Secret` |
 
 ### 2.2 Authentication Flow
 
@@ -406,6 +409,22 @@ Store `serverURL`, `userId`, and `accessToken` together as one Keychain item per
 `LoginView` uses a plain SwiftUI `TextField` (server URL), `TextField` (username), and `SecureField` (password) bound to `@State`/`@Bindable` view-model properties, with `.textInputAutocapitalization(.never)` and autocorrection disabled on the URL field only.
 
 watchOS presents its own text input chooser (scribble, dictation, emoji, or wrist-to-iPhone keyboard handoff) automatically when a `TextField` becomes focused — **no extra code is required or possible** to request handoff specifically. The implementation must not assume handoff is available (it requires a reachable paired iPhone) and must not impose a timeout on text entry, since handoff round-trips through the paired phone and can take longer than on-device scribble. If validation against `/System/Info/Public` fails after the server URL is entered, show an inline error ("Can't reach this server") before letting the user proceed to credentials, rather than failing only after a full auth attempt.
+
+### 2.7 Quick Connect Authentication
+
+An alternative to typing username/password once the server URL has validated: the user approves a short code from an already-signed-in Jellyfin client (mobile app, web UI) instead of entering credentials on the watch. Both paths remain available side by side — Quick Connect can be disabled per-server, so password login is never removed.
+
+Flow:
+1. **Initiate** — `POST /QuickConnect/Initiate`, no auth. Returns `{ "Authenticated": false, "Secret": "...", "Code": "ABC123", "DateAdded": "..." }`. A `401` here means Quick Connect is disabled on this server; there is no separate `/QuickConnect/Enabled` pre-check.
+2. **Display** — show `Code` to the user with the instruction to enter it in Jellyfin on another device.
+3. **Poll** — `GET /QuickConnect/Connect?secret=<Secret>`, same response shape, until `Authenticated == true`.
+4. **Exchange** — `POST /Users/AuthenticateWithQuickConnect` with body `{"Secret": "<Secret>"}`. Returns the **same `AuthenticationResult` shape as `/Users/AuthenticateByName`** (§2.2) — `User{Id,Name,ServerId}`, `AccessToken`, `ServerId` — so the resulting token is stored via the identical Keychain/`ServerConfiguration` path as password login (§2.5).
+
+**Bounded exception to §2.1 ("no polling on a timer"):** step 3 is inherently poll-based, which soul.md otherwise prohibits. This is scoped narrowly rather than treated as a standing exception:
+- Implemented as a single structured-concurrency loop (`Task` + `Task.sleep`), not a repeating `Timer` or `NotificationCenter` observer.
+- Fixed cadence of 2 seconds, hard cap of 150 attempts (~5 minutes) — matching the server's own Quick Connect code expiry window, so the watch never polls longer than the code could possibly remain valid.
+- Runs only while the Quick Connect pending screen is on-screen; cancelled immediately on approval, on explicit user cancellation, on the attempt cap, and via the screen's `onDisappear` (covers navigating away and the success transition alike).
+- One-time bootstrap cost to obtain a token, not steady-state behavior — once signed in, no further polling occurs.
 
 ---
 
