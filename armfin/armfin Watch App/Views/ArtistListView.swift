@@ -7,7 +7,6 @@ struct ArtistListView: View {
     private let serverURL: String
     private let userId: String
     private let accessToken: String
-    private let apiClient = JellyfinAPIClient()
 
     init(serverURL: String, userId: String, accessToken: String) {
         self.serverURL = serverURL
@@ -53,12 +52,9 @@ struct ArtistListView: View {
             }
 
             if viewModel.hasMore {
-                ProgressView()
-                    .frame(maxWidth: .infinity)
-                    .listRowBackground(Color.clear)
-                    .onAppear {
-                        Task { await viewModel.loadMore() }
-                    }
+                PaginationFooter(errorMessage: viewModel.loadMoreError) {
+                    await viewModel.loadMore()
+                }
             }
         }
         .listStyle(.plain)
@@ -78,7 +74,7 @@ struct ArtistListView: View {
         } label: {
             HStack(spacing: 10) {
                 JellyfinImage(
-                    url: apiClient.imageURL(
+                    url: JellyfinAPIClient.imageURL(
                         serverURL: serverURL,
                         itemId: artist.id,
                         maxWidth: 56,

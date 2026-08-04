@@ -9,7 +9,9 @@ private let appLog = Logger(subsystem: "com.armfin", category: "App")
 /// against a marker file on launch and wipes the database BEFORE
 /// `ModelContainer` is ever constructed — avoiding the CoreData
 /// precondition trap that cannot be caught with do/catch.
-private let currentSchemaVersion = 5
+/// 6: `BetaDownloadItem` gained `indexNumber`/`discNumber` so downloaded
+///    albums can list in real album order offline.
+private let currentSchemaVersion = 6
 
 @main
 struct ArmfinApp: App {
@@ -184,7 +186,7 @@ struct ArmfinApp: App {
 
     var body: some Scene {
         WindowGroup {
-            LoginView(didResetCorruptData: $didResetCorruptData)
+            RootView(didResetCorruptData: $didResetCorruptData)
                 .environment(\.playbackEngine, playbackEngine)
                 .environment(\.nowPlayingManager, nowPlayingManager)
                 .environment(\.networkStatusService, networkStatusService)

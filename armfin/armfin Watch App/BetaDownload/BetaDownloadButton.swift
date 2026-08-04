@@ -5,26 +5,25 @@ struct BetaDownloadButton: View {
     let jellyfinId: String
     var onDownloadNew: (() -> Void)? = nil
 
-    @Query private var allBetaItems: [BetaDownloadItem]
-
-    private var item: BetaDownloadItem? {
-        allBetaItems.first { $0.jellyfinId == jellyfinId }
-    }
-
     var body: some View {
-        Button {
-            handleTap()
-        } label: {
-            icon
-                .font(.callout)
-                .frame(width: 36, height: 36)
+        // One row per track list means this view is instantiated dozens of
+        // times; scanning every download in each of them was O(rows x
+        // downloads) per body pass.
+        DownloadItemReader(jellyfinId: jellyfinId) { item in
+            Button {
+                handleTap(item)
+            } label: {
+                icon(for: item)
+                    .font(.callout)
+                    .frame(width: 36, height: 36)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(accessibilityText(for: item))
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityText)
     }
 
     @ViewBuilder
-    private var icon: some View {
+    private func icon(for item: BetaDownloadItem?) -> some View {
         switch item?.status {
         case nil:
             Image(systemName: "arrow.down.circle")
@@ -48,7 +47,7 @@ struct BetaDownloadButton: View {
         }
     }
 
-    private var accessibilityText: String {
+    private func accessibilityText(for item: BetaDownloadItem?) -> String {
         switch item?.status {
         case nil: return "Download"
         case .queued: return "Download Queued"
@@ -58,7 +57,7 @@ struct BetaDownloadButton: View {
         }
     }
 
-    private func handleTap() {
+    private func handleTap(_ item: BetaDownloadItem?) {
         guard let item else {
             onDownloadNew?()
             return

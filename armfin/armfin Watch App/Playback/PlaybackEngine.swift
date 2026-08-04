@@ -1,20 +1,24 @@
 import AVFoundation
 import Foundation
 import SwiftData
+import os
 
+private let log = Logger(subsystem: "com.armfin", category: "Playback")
+
+/// What the player is doing, as far as the UI needs to care.
+///
+/// Deliberately small. The previous version had eight cases — `readyToPlay`,
+/// `buffering` and `loadingItem` were separate — which the UI then had to
+/// re-collapse into "spinner or not". More cases meant more ways for a stored
+/// value to be wrong.
 enum PlaybackState: Equatable {
     case idle
-    case loadingItem(trackId: String)
-    case readyToPlay
+    /// Preparing: activating the audio session, resolving a URL, loading the
+    /// asset, or waiting for the player to have enough to start.
+    case loading
     case playing
     case paused
-    case buffering
-    case finishedTrack
     case failed(message: String)
-}
-
-enum PlaybackEngineError: Error, Equatable {
-    case unresolvedStreamingURL
 }
 
 struct QueueItem: Equatable, Sendable {
@@ -27,10 +31,13 @@ struct QueueItem: Equatable, Sendable {
     let serverURL: String
     let accessToken: String
     let artworkURL: URL?
+    let indexNumber: Int?
+    let discNumber: Int?
 
     init(trackId: String, title: String, artistName: String, albumName: String,
          albumId: String? = nil, durationSeconds: Double, serverURL: String,
-         accessToken: String, artworkURL: URL? = nil) {
+         accessToken: String, artworkURL: URL? = nil,
+         indexNumber: Int? = nil, discNumber: Int? = nil) {
         self.trackId = trackId
         self.title = title
         self.artistName = artistName
@@ -40,131 +47,144 @@ struct QueueItem: Equatable, Sendable {
         self.serverURL = serverURL
         self.accessToken = accessToken
         self.artworkURL = artworkURL
+        self.indexNumber = indexNumber
+        self.discNumber = discNumber
     }
 }
 
+/// Plays a queue of tracks, preferring a completed download over streaming.
+///
+/// ## Design
+///
+/// **State is derived, never stored.** `currentState` is computed from the
+/// player every time it is read. AVFoundation types are `Observable` in the 26
+/// releases, so reading `player.timeControlStatus` here registers a dependency
+/// and SwiftUI updates on its own. The previous engine kept `currentState` as
+/// a stored variable mutated from two KVO observers, two notification handlers
+/// and five entry points, each guarded by a generation token — so the value
+/// could, and did, disagree with the player. It cannot now, because it *is*
+/// the player.
+///
+/// **One load path.** `load(index:)` is the only function that touches the
+/// player's item. Every public entry point routes through it.
+///
+/// **One supersession check.** A single `loadID`, compared in exactly one
+/// place (`isCurrent`), decides whether an in-flight load still owns the
+/// engine. There are no per-item observers, so there is nothing else to guard.
+///
+/// **Nothing is abandoned on a timer.** No watchdogs. Activating a
+/// `.longFormAudio` session on watchOS returns only once an output route
+/// exists, and giving up on it early cannot make audio arrive sooner.
 @Observable
 @MainActor
 final class PlaybackEngine {
 
+    // MARK: - Player
+
+    @ObservationIgnored
+    private let player: AVPlayer
+
     // MARK: - Queue
 
     private(set) var queue: [QueueItem] = []
+    private(set) var isShuffleEnabled = false
+    private(set) var currentIndex: Int?
+
+    @ObservationIgnored
     private var originalQueue: [QueueItem] = []
-    private(set) var currentQueueItem: QueueItem?
-    private(set) var isShuffleEnabled: Bool = false
 
-    // MARK: - Observable state
+    var currentQueueItem: QueueItem? {
+        guard let currentIndex, queue.indices.contains(currentIndex) else { return nil }
+        return queue[currentIndex]
+    }
 
-    private(set) var currentState: PlaybackState = .idle
+    /// Called whenever the engine moves to a different track, so Now Playing
+    /// metadata can follow it.
+    @ObservationIgnored
+    var onQueueItemChanged: ((QueueItem) -> Void)?
 
-    private var wasPlayingBeforeInterruption = false
+    // MARK: - Engine-owned state
+    //
+    // Only the two things the player genuinely cannot report: that we are
+    // between "user tapped" and "item handed to the player", and that a load
+    // failed before an item ever existed.
 
-    // MARK: - AVFoundation objects
+    private var isPreparing = false
+    private var failureMessage: String?
+
+    /// Derived from the player on every read — see the type-level note.
+    var currentState: PlaybackState {
+        if let failureMessage { return .failed(message: failureMessage) }
+        if isPreparing { return .loading }
+        guard let item = player.currentItem else { return .idle }
+        if item.status == .failed {
+            return .failed(message: item.error?.localizedDescription ?? "Playback failed.")
+        }
+        switch player.timeControlStatus {
+        case .playing: return .playing
+        case .waitingToPlayAtSpecifiedRate: return .loading
+        case .paused: return .paused
+        @unknown default: return .paused
+        }
+    }
+
+    // MARK: - Load bookkeeping
 
     @ObservationIgnored
-    private let player = AVPlayer()
+    private var loadTask: Task<Void, Never>?
+
+    /// Incremented per load attempt. `isCurrent(_:)` is the single place it is
+    /// compared, and every step of a load re-checks it after an `await`.
     @ObservationIgnored
-    private var currentItem: AVPlayerItem?
+    private var loadID = 0
 
-    // MARK: - Retained track identity
-
-    private var currentTrackId: String?
-    private var currentServerURL: String?
-    private var currentAccessToken: String?
-    private var currentPreferDirectPlay = false
-    private var currentItemURL: URL?
-
-    // MARK: - KVO tokens
+    // MARK: - Audio session
 
     @ObservationIgnored
-    private var timeControlStatusObservation: NSKeyValueObservation?
+    private var isSessionActive = false
+
+    /// The in-flight activation, shared by every caller that arrives while it
+    /// runs. Without this, two taps in quick succession each start their own
+    /// activation and race.
     @ObservationIgnored
-    private var itemStatusObservation: NSKeyValueObservation?
+    private var activationTask: Task<Bool, Never>?
 
-    // MARK: - Play-attempt generation tracking
-
-    /// Monotonically incrementing token. Every `play(trackId:...)`,
-    /// `playLocalFile(url:trackId:)`, and the local-file-switch branch of the
-    /// zero-argument `play()` bumps this and captures the new value as "its"
-    /// generation. Every state-mutating step belonging to that attempt
-    /// (continuation after an `await`, KVO callback, notification callback)
-    /// must reconfirm the engine's generation still matches before touching
-    /// `currentItem`, `currentItemURL`, or `currentState`. This is what
-    /// actually prevents a superseded attempt from corrupting state — the
-    /// stored `Task` below is only a best-effort optimization, not a
-    /// correctness guarantee (see `activeLoadTask`).
-    private var playAttemptGeneration = 0
-
-    /// Handle to the in-flight load `Task` for the current play attempt.
-    /// Cancelled (not awaited) whenever a new attempt begins, so wasted
-    /// `asset.load`/audio-session work is abandoned promptly. Cooperative
-    /// cancellation does not interrupt a KVO observer closure or guarantee
-    /// `AVURLAsset.load` stops immediately, so `playAttemptGeneration` above
-    /// remains the actual correctness mechanism even when this fires.
-    @ObservationIgnored
-    private var activeLoadTask: Task<Void, Never>?
-
-    /// Artificial delay injected immediately before `asset.load(.isPlayable)`
-    /// inside `loadAndPlayAsync`, for deterministic rapid-switch test repros
-    /// (e.g. forcing track A's local-file load to outlast track B's so a
-    /// test harness can assert A's stale resolution is a no-op). Has zero
-    /// effect and is hard-coded to 0 outside DEBUG builds.
-    #if DEBUG
-    var debugLoadDelay: TimeInterval = 0
-    #endif
-
-    // MARK: - NotificationCenter tokens
+    // MARK: - Dependencies
 
     @ObservationIgnored
-    private nonisolated(unsafe) var didPlayToEndTimeToken: NSObjectProtocol?
+    private nonisolated(unsafe) var modelContext: ModelContext?
+
     @ObservationIgnored
-    private nonisolated(unsafe) var failedToPlayToEndTimeToken: NSObjectProtocol?
+    private nonisolated(unsafe) var didPlayToEndToken: NSObjectProtocol?
     @ObservationIgnored
     private nonisolated(unsafe) var interruptionToken: NSObjectProtocol?
     @ObservationIgnored
     private nonisolated(unsafe) var routeChangeToken: NSObjectProtocol?
 
-    // MARK: - Dependencies
+    private var wasPlayingBeforeInterruption = false
 
-    @ObservationIgnored
-    private let apiClient: JellyfinAPIClient
+    // MARK: - Init
 
-    @ObservationIgnored
-    private nonisolated(unsafe) var modelContext: ModelContext?
+    init() {
+        // Opt AVFoundation into Swift Observation. This is what lets
+        // `currentState` be derived rather than mirrored. It is a type-level
+        // switch, so it must be set before any player is created.
+        AVPlayer.isObservationEnabled = true
+        player = AVPlayer()
 
-    /// Whether the audio session has been fully activated via the async
-    /// `activate()` method (which handles Bluetooth route selection on watchOS).
-    @ObservationIgnored
-    private var isAudioSessionActivated = false
-
-    init(apiClient: JellyfinAPIClient = JellyfinAPIClient()) {
-        self.apiClient = apiClient
+        // Leave this on. It makes `play()` mean "start as soon as the item is
+        // ready" rather than "set the rate right now". `replaceCurrentItem`
+        // does not make an item ready synchronously — not even for a local
+        // file — so turning it off makes `play()` set a rate the player
+        // immediately drops, which reads as play-then-pause with no audio.
         player.automaticallyWaitsToMinimizeStalling = true
-        registerInterruptionObserver()
-        registerRouteChangeObserver()
 
-        do {
-            try configureAudioSessionCategory()
-        } catch {
-        }
+        registerObservers()
     }
 
     deinit {
-        timeControlStatusObservation?.invalidate()
-        itemStatusObservation?.invalidate()
-
-        if let didPlayToEndTimeToken {
-            NotificationCenter.default.removeObserver(didPlayToEndTimeToken)
-        }
-        if let failedToPlayToEndTimeToken {
-            NotificationCenter.default.removeObserver(failedToPlayToEndTimeToken)
-        }
-        if let interruptionToken {
-            NotificationCenter.default.removeObserver(interruptionToken)
-        }
-        if let routeChangeToken {
-            NotificationCenter.default.removeObserver(routeChangeToken)
+        for token in [didPlayToEndToken, interruptionToken, routeChangeToken] {
+            if let token { NotificationCenter.default.removeObserver(token) }
         }
     }
 
@@ -172,439 +192,61 @@ final class PlaybackEngine {
         modelContext = context
     }
 
-    // MARK: - Audio session configuration (§3.4)
+    // MARK: - Queue management
 
-    /// Sets the audio session category and policy. Called once from init.
-    /// Does NOT activate — activation must go through `activateAudioSession()`.
-    func configureAudioSessionCategory() throws {
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playback, mode: .default, policy: .longFormAudio, options: [])
+    func setQueue(_ items: [QueueItem], startingAt startTrackId: String? = nil) {
+        originalQueue = items
+        queue = isShuffleEnabled
+            ? shuffled(items, pinning: startTrackId ?? items.first?.trackId)
+            : items
     }
 
-    /// Bounded watchdog for the async `AVAudioSession.activate()` call below.
-    /// That call negotiates Bluetooth/route selection on watchOS and can, in
-    /// practice, stall indefinitely (observed: a shuffled downloaded track
-    /// stuck in `.loadingItem` forever with no failure state, resolved only
-    /// once a subsequent `play()` attempt happened to land after the stall
-    /// cleared). Unlike `asset.load(.isPlayable)`, this await previously had
-    /// no timeout at all — this is what actually bounds it. On timeout we
-    /// fall through to the same synchronous `setActive(true)` fallback used
-    /// for a thrown error, rather than failing the track outright, since that
-    /// fallback is already relied on elsewhere (post-interruption resume).
-    private static let activationWatchdogTimeout: TimeInterval = 6
-
-    /// Activates the audio session using the async watchOS `activate()` method
-    /// which handles Bluetooth route selection. Must be called before first
-    /// playback. Subsequent calls are no-ops if already activated.
-    /// Returns `true` if a valid audio route is available.
-    func activateAudioSession() async -> Bool {
-        guard !isAudioSessionActivated else { return true }
-
-        do {
-            try configureAudioSessionCategory()
-        } catch {
-        }
-
-        let activated = await raceAgainstWatchdog(timeout: Self.activationWatchdogTimeout, timeoutValue: false) {
-            do {
-                try await AVAudioSession.sharedInstance().activate()
-                return true
-            } catch {
-                return false
-            }
-        }
-
-        if activated {
-            isAudioSessionActivated = true
-            return true
-        }
-
-        do {
-            try AVAudioSession.sharedInstance().setActive(true)
-            isAudioSessionActivated = true
-            return true
-        } catch {
-            isAudioSessionActivated = false
-            return false
-        }
+    func toggleShuffle() {
+        isShuffleEnabled.toggle()
+        let playing = currentQueueItem?.trackId
+        queue = isShuffleEnabled ? shuffled(originalQueue, pinning: playing) : originalQueue
+        // The current track keeps playing; only its position changed.
+        currentIndex = playing.flatMap { id in queue.firstIndex { $0.trackId == id } }
     }
 
-    /// Synchronous fallback for re-activating the session after interruptions
-    /// or route changes, when the async route picker isn't needed.
-    private func ensureAudioSessionActive() {
-        do {
-            try AVAudioSession.sharedInstance().setActive(true)
-        } catch {
+    private func shuffled(_ items: [QueueItem], pinning trackId: String?) -> [QueueItem] {
+        guard items.count > 1 else { return items }
+        var result = items.shuffled()
+        if let trackId, let at = result.firstIndex(where: { $0.trackId == trackId }), at != 0 {
+            result.swapAt(0, at)
         }
+        return result
     }
 
-    // MARK: - Streaming URL resolution
+    // MARK: - Public playback control
 
-    func resolveStreamingURL(
-        serverURL: String,
-        accessToken: String,
-        trackId: String,
-        preferDirectPlay: Bool = false
-    ) -> Result<URL, PlaybackEngineError> {
-        guard let url = apiClient.streamingURL(
-            serverURL: serverURL,
-            accessToken: accessToken,
-            trackId: trackId,
-            preferDirectPlay: preferDirectPlay
-        ) else {
-            return .failure(.unresolvedStreamingURL)
-        }
-        return .success(url)
-    }
-
-    // MARK: - Local-file URL resolution
-
-    private func resolveLocalFileURL(trackId: String) -> URL? {
-        guard let modelContext else { return nil }
-
-        let betaPredicate = #Predicate<BetaDownloadItem> {
-            $0.jellyfinId == trackId && $0.statusRaw == "completed"
-        }
-        if let betaItem = try? modelContext.fetch(FetchDescriptor(predicate: betaPredicate)).first,
-           let fileName = betaItem.localFileName {
-            let fileURL = BetaDownloadManager.downloadsDirectory.appendingPathComponent(fileName)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                return fileURL
-            }
-            betaItem.statusRaw = BetaDownloadStatus.failed.rawValue
-            betaItem.lastError = "File missing from disk"
-            try? modelContext.save()
-        }
-
-        return nil
-    }
-
-    // MARK: - Playback control
-
-    /// Begins a new play attempt: bumps `playAttemptGeneration` and cancels
-    /// whatever `Task` was tracking the previous attempt. Returns the new
-    /// generation, which the caller must thread through to every subsequent
-    /// state-mutating step of this attempt. Every call site that starts a
-    /// load (`play(trackId:...)`, `playLocalFile(url:trackId:)`, and the
-    /// local-file-switch branch of `play()`) must route through this so the
-    /// guard logic exists in exactly one place.
-    private func beginNewPlayAttempt() -> Int {
-        activeLoadTask?.cancel()
-        playAttemptGeneration += 1
-        return playAttemptGeneration
-    }
-
-    /// True if `generation` is still the engine's current play attempt.
-    /// Every continuation after an `await`, and every KVO/notification
-    /// callback, must check this before mutating `currentItem`,
-    /// `currentItemURL`, or `currentState` — a `false` result means a newer
-    /// `play()` call has superseded this attempt and it must be a no-op.
-    private func isCurrent(_ generation: Int) -> Bool {
-        generation == playAttemptGeneration
-    }
-
-    func play(
-        trackId: String,
-        serverURL: String,
-        accessToken: String,
-        preferDirectPlay: Bool = false
-    ) {
-        let generation = beginNewPlayAttempt()
-
-        currentState = .loadingItem(trackId: trackId)
-
-        currentTrackId = trackId
-        currentServerURL = serverURL
-        currentAccessToken = accessToken
-        currentPreferDirectPlay = preferDirectPlay
-
-        if let item = queue.first(where: { $0.trackId == trackId }) {
-            currentQueueItem = item
-        }
-
-        activeLoadTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            if !self.isAudioSessionActivated {
-                let activated = await self.activateAudioSession()
-                guard self.isCurrent(generation) else { return }
-                if !activated {
-                    self.currentState = .failed(message: "Connect headphones to play audio.")
-                    return
-                }
-            }
-            guard self.isCurrent(generation) else { return }
-            await self.startPlayback(
-                generation: generation,
-                trackId: trackId,
-                serverURL: serverURL,
-                accessToken: accessToken,
-                preferDirectPlay: preferDirectPlay
-            )
-        }
-    }
-
-    private func startPlayback(
-        generation: Int,
-        trackId: String,
-        serverURL: String,
-        accessToken: String,
-        preferDirectPlay: Bool
-    ) async {
-        guard isCurrent(generation) else { return }
-
-        if let localURL = resolveLocalFileURL(trackId: trackId) {
-            await loadAndPlayAsync(url: localURL, generation: generation)
+    /// Starts the queued track with this id. `serverURL`/`accessToken` are
+    /// accepted for call-site convenience; the queue entry's own credentials
+    /// are what actually get used.
+    func play(trackId: String, serverURL: String = "", accessToken: String = "", preferDirectPlay: Bool = false) {
+        guard let index = queue.firstIndex(where: { $0.trackId == trackId }) else {
+            log.error("play(trackId:) for a track that is not in the queue")
+            failureMessage = "That track isn't in the current queue."
             return
         }
-
-        guard !serverURL.isEmpty, !accessToken.isEmpty else {
-            handleOfflinePlaybackUnavailable()
-            return
-        }
-
-        switch resolveStreamingURL(
-            serverURL: serverURL,
-            accessToken: accessToken,
-            trackId: trackId,
-            preferDirectPlay: preferDirectPlay
-        ) {
-        case .failure:
-            currentState = .failed(message: "Could not resolve a streaming URL for this track.")
-        case .success(let url):
-            loadAndPlay(url: url, generation: generation)
-        }
+        load(index: index, reason: "play(trackId:)")
     }
 
-    /// When a track can't be played offline and has no server credentials,
-    /// skip to the next track in the queue instead of leaving the player in
-    /// a failed state that can crash the UI. Only fails if no playable track
-    /// remains.
-    private func handleOfflinePlaybackUnavailable() {
-        guard !queue.isEmpty, let currentTrackId else {
-            currentState = .failed(message: "Track not available offline.")
-            return
-        }
-        guard let currentIndex = queue.firstIndex(where: { $0.trackId == currentTrackId }) else {
-            currentState = .failed(message: "Track not available offline.")
-            return
-        }
-        let nextIndex = currentIndex + 1
-        if nextIndex < queue.count {
-            let nextItem = queue[nextIndex]
-            if resolveLocalFileURL(trackId: nextItem.trackId) != nil
-                || (!nextItem.serverURL.isEmpty && !nextItem.accessToken.isEmpty) {
-                playQueueItem(at: nextIndex)
-            } else {
-                currentState = .failed(message: "No playable tracks available offline.")
-            }
-        } else {
-            currentState = .failed(message: "Track not available offline.")
-        }
-    }
-
-    /// Bounded watchdog for `loadAndPlayAsync`'s `asset.load(.isPlayable)`
-    /// call. 6 seconds is a reasoned default for a local file's
-    /// "is this playable" check — not an Apple-stated number — chosen to be
-    /// comfortably longer than any real on-disk load while still bounding a
-    /// genuinely stuck attempt to a user-noticeable but not indefinite wait.
-    /// This is defense-in-depth only: it does not fix the race (the
-    /// generation check does), it only prevents a single, non-superseded
-    /// attempt from hanging forever for an unrelated reason (e.g. a stalled
-    /// disk read).
-    private static let loadWatchdogTimeout: TimeInterval = 6
-
-    private enum LoadOutcome: Sendable {
-        case playable(Bool)
-        case timedOut
-    }
-
-    /// `@MainActor`-isolated mutable flag shared between the load task and
-    /// the watchdog task in `raceAgainstWatchdog`, so exactly one of them
-    /// resumes the race's continuation. A plain captured `var` can't cross
-    /// into a `@Sendable` `Task` closure by reference; this box can, because
-    /// its mutable state is actor-isolated rather than ad hoc shared memory.
-    @MainActor
-    private final class MainActorFlag {
-        var value = false
-    }
-
-    private func loadAndPlay(url: URL, generation: Int) {
-        guard isCurrent(generation) else { return }
-
-        tearDownObservers()
-
-        if url.isFileURL && !FileManager.default.fileExists(atPath: url.path) {
-            currentState = .failed(message: "Downloaded file is missing.")
-            advanceToNextOnFailure()
-            return
-        }
-
-        let asset = AVURLAsset(url: url)
-        let item = AVPlayerItem(asset: asset)
-        currentItem = item
-        currentItemURL = url
-        player.replaceCurrentItem(with: item)
-
-        attachObservers(to: item, generation: generation)
-
-        player.play()
-    }
-
-    private func loadAndPlayAsync(url: URL, generation: Int) async {
-        guard isCurrent(generation) else { return }
-
-        tearDownObservers()
-
-        if url.isFileURL && !FileManager.default.fileExists(atPath: url.path) {
-            currentState = .failed(message: "Downloaded file is missing.")
-            advanceToNextOnFailure()
-            return
-        }
-
-        let asset = AVURLAsset(url: url)
-
-        if url.isFileURL {
-            #if DEBUG
-            let injectedDelay = debugLoadDelay
-            #else
-            let injectedDelay = 0.0
-            #endif
-
-            let outcome = await raceAgainstWatchdog(timeout: Self.loadWatchdogTimeout, timeoutValue: .timedOut) {
-                if injectedDelay > 0 {
-                    try? await Task.sleep(for: .seconds(injectedDelay))
-                }
-                do {
-                    return LoadOutcome.playable(try await asset.load(.isPlayable))
-                } catch {
-                    return LoadOutcome.playable(false)
-                }
-            }
-
-            guard isCurrent(generation) else { return }
-
-            switch outcome {
-            case .timedOut:
-                asset.cancelLoading()
-                currentState = .failed(message: "Loading this track timed out.")
-                advanceToNextOnFailure()
-                return
-            case .playable(false):
-                currentState = .failed(message: "This audio format is not supported.")
-                advanceToNextOnFailure()
-                return
-            case .playable(true):
-                break
-            }
-        }
-
-        guard isCurrent(generation) else { return }
-
-        let item = AVPlayerItem(asset: asset)
-        currentItem = item
-        currentItemURL = url
-        player.replaceCurrentItem(with: item)
-
-        attachObservers(to: item, generation: generation)
-
-        player.play()
-    }
-
-    /// Races a `@MainActor`-isolated load operation against a timeout.
-    /// Returns the operation's result if it finishes first, or `.timedOut`
-    /// if the watchdog fires first. Both the load and the watchdog run as
-    /// child `Task`s of the calling `@MainActor` context (not a `Sendable`
-    /// task group), so the non-Sendable `AVURLAsset` never needs to cross an
-    /// isolation boundary. Whichever finishes first resumes the shared
-    /// continuation (guarded so only the first resumption counts); the loser
-    /// is cancelled cooperatively. Per the research notes this does not
-    /// guarantee `asset.load` halts immediately on cancellation —
-    /// `asset.cancelLoading()` at the call site is what actually stops the
-    /// AVFoundation-side work.
-    private func raceAgainstWatchdog<T: Sendable>(
-        timeout: TimeInterval,
-        timeoutValue: T,
-        operation: @escaping @MainActor () async -> T
-    ) async -> T {
-        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
-            let hasResumed = MainActorFlag()
-
-            let loadTask = Task { @MainActor in
-                let result = await operation()
-                guard !hasResumed.value else { return }
-                hasResumed.value = true
-                continuation.resume(returning: result)
-            }
-
-            Task { @MainActor in
-                try? await Task.sleep(for: .seconds(timeout))
-                guard !hasResumed.value else { return }
-                hasResumed.value = true
-                loadTask.cancel()
-                continuation.resume(returning: timeoutValue)
-            }
-        }
-    }
-
-    /// When a track fails to load (missing file, decode error), try
-    /// advancing to the next track in the queue rather than leaving
-    /// the player in a permanent failed state.
-    private func advanceToNextOnFailure() {
-        guard !queue.isEmpty, let currentTrackId,
-              let currentIndex = queue.firstIndex(where: { $0.trackId == currentTrackId }) else {
-            return
-        }
-        let nextIndex = currentIndex + 1
-        if nextIndex < queue.count {
-            Task { @MainActor [weak self] in
-                self?.playQueueItem(at: nextIndex)
-            }
-        }
+    /// Kept for call sites that already resolved a downloaded file. `load`
+    /// re-resolves the URL anyway, so this is just "play this queued track".
+    func playLocalFile(url: URL, trackId: String) {
+        play(trackId: trackId)
     }
 
     func play() {
-        guard currentItem != nil else { return }
-
-        ensureAudioSessionActive()
-
-        if let trackId = currentTrackId,
-           let localURL = resolveLocalFileURL(trackId: trackId),
-           localURL != currentItemURL {
-            let generation = beginNewPlayAttempt()
-            loadAndPlay(url: localURL, generation: generation)
+        guard player.currentItem != nil else {
+            // Nothing loaded — restart the current queue entry rather than
+            // silently doing nothing.
+            if let currentIndex { load(index: currentIndex, reason: "play() with no item") }
             return
         }
-
-        player.play()
-    }
-
-    /// Resets the activation flag so the next play triggers the full async
-    /// route-picker activation flow again. Called after audio session
-    /// deactivation events.
-    func invalidateAudioSession() {
-        isAudioSessionActivated = false
-    }
-
-    func stop() {
-        // Supersede any in-flight load attempt so its eventual resolution
-        // (a stale `await` continuation or KVO callback that cooperative
-        // cancellation didn't silence) cannot resurrect state after stop.
-        _ = beginNewPlayAttempt()
-
-        wasPlayingBeforeInterruption = false
-        player.pause()
-        tearDownObservers()
-        player.replaceCurrentItem(with: nil)
-        currentItem = nil
-        currentItemURL = nil
-        currentTrackId = nil
-        currentServerURL = nil
-        currentAccessToken = nil
-        currentQueueItem = nil
-        queue = []
-        originalQueue = []
-        isShuffleEnabled = false
-        currentState = .idle
+        failureMessage = nil
+        withActiveSession { [weak self] in self?.player.play() }
     }
 
     func pause() {
@@ -613,23 +255,64 @@ final class PlaybackEngine {
     }
 
     func togglePlayPause() {
-        if currentState == .playing {
+        switch currentState {
+        case .playing:
             pause()
-        } else if case .failed = currentState, currentItem == nil,
-                  let trackId = currentTrackId,
-                  let serverURL = currentServerURL,
-                  let accessToken = currentAccessToken {
-            isAudioSessionActivated = false
-            play(trackId: trackId, serverURL: serverURL, accessToken: accessToken, preferDirectPlay: currentPreferDirectPlay)
-        } else {
+        case .failed:
+            // Retry the track rather than toggling into a state it can't reach.
+            if let currentIndex { load(index: currentIndex, reason: "retry after failure") }
+        case .idle, .loading, .paused:
             play()
         }
     }
 
+    func advanceToNext() {
+        guard !queue.isEmpty else { return }
+        let next = (currentIndex ?? -1) + 1
+        if next < queue.count {
+            load(index: next, reason: "advanceToNext")
+        } else {
+            if isShuffleEnabled { queue = shuffled(originalQueue, pinning: nil) }
+            load(index: 0, reason: "advanceToNext wrap")
+        }
+    }
+
+    func returnToPrevious() {
+        guard !queue.isEmpty else { return }
+        if currentTime > 3 {
+            seek(to: 0)
+            return
+        }
+        let previous = (currentIndex ?? 0) - 1
+        if previous >= 0 {
+            load(index: previous, reason: "returnToPrevious")
+        } else if !isShuffleEnabled {
+            load(index: queue.count - 1, reason: "returnToPrevious wrap")
+        }
+    }
+
+    func stop() {
+        loadID += 1
+        loadTask?.cancel()
+        loadTask = nil
+
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+
+        queue = []
+        originalQueue = []
+        currentIndex = nil
+        isShuffleEnabled = false
+        isPreparing = false
+        failureMessage = nil
+        wasPlayingBeforeInterruption = false
+    }
+
+    // MARK: - Time
+
     var currentTime: TimeInterval {
         let seconds = player.currentTime().seconds
-        guard seconds.isFinite else { return 0 }
-        return seconds
+        return seconds.isFinite ? seconds : 0
     }
 
     func seek(to time: TimeInterval) {
@@ -644,309 +327,261 @@ final class PlaybackEngine {
         player.removeTimeObserver(observer)
     }
 
-    func advanceToNext() {
-        guard !queue.isEmpty, let currentTrackId else { return }
-        guard let currentIndex = queue.firstIndex(where: { $0.trackId == currentTrackId }) else { return }
-        let nextIndex = currentIndex + 1
-        if nextIndex < queue.count {
-            playQueueItem(at: nextIndex)
-        } else if !isShuffleEnabled {
-            playQueueItem(at: 0)
-        }
-    }
+    // MARK: - The one load path
 
-    func returnToPrevious() {
-        if currentTime > 3.0 {
-            seek(to: 0)
-            return
-        }
-
-        guard !queue.isEmpty, let currentTrackId else { return }
-        guard let currentIndex = queue.firstIndex(where: { $0.trackId == currentTrackId }) else { return }
-        let previousIndex = currentIndex - 1
-        if previousIndex >= 0 {
-            playQueueItem(at: previousIndex)
-        } else if !isShuffleEnabled {
-            playQueueItem(at: queue.count - 1)
-        }
-    }
-
-    func setQueue(_ items: [QueueItem], startingAt startTrackId: String? = nil) {
-        originalQueue = items
-        if isShuffleEnabled {
-            queue = shuffled(items, pinningTrackId: startTrackId ?? items.first?.trackId)
-        } else {
-            queue = items
-        }
-    }
-
-    func toggleShuffle() {
-        isShuffleEnabled.toggle()
-        if isShuffleEnabled {
-            queue = shuffled(originalQueue, pinningTrackId: currentTrackId)
-        } else {
-            queue = originalQueue
-        }
-    }
-
-    private func shuffled(_ items: [QueueItem], pinningTrackId: String?) -> [QueueItem] {
-        guard items.count > 1 else { return items }
-        var result = items.shuffled()
-        if let pinId = pinningTrackId,
-           let pinIndex = result.firstIndex(where: { $0.trackId == pinId }),
-           pinIndex != 0 {
-            result.swapAt(0, pinIndex)
-        }
-        return result
-    }
-
-    private func playQueueItem(at index: Int) {
+    /// Everything that starts a track goes through here.
+    private func load(index: Int, reason: String) {
         guard queue.indices.contains(index) else { return }
         let item = queue[index]
-        currentQueueItem = item
-        play(
-            trackId: item.trackId,
-            serverURL: item.serverURL,
-            accessToken: item.accessToken
-        )
+
+        loadID += 1
+        let id = loadID
+        loadTask?.cancel()
+
+        currentIndex = index
+        failureMessage = nil
+        isPreparing = true
+
         onQueueItemChanged?(item)
-    }
+        log.notice("Loading queue index \(index) reason=\(reason, privacy: .public)")
 
-    @ObservationIgnored
-    var onQueueItemChanged: ((QueueItem) -> Void)?
-
-    func playLocalFile(url: URL, trackId: String) {
-        let generation = beginNewPlayAttempt()
-
-        currentState = .loadingItem(trackId: trackId)
-        currentTrackId = trackId
-        currentServerURL = ""
-        currentAccessToken = ""
-        currentPreferDirectPlay = false
-
-        if let item = queue.first(where: { $0.trackId == trackId }) {
-            currentQueueItem = item
-        }
-
-        activeLoadTask = Task { @MainActor [weak self] in
+        loadTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            if !self.isAudioSessionActivated {
-                let activated = await self.activateAudioSession()
-                guard self.isCurrent(generation) else { return }
-                if !activated {
-                    self.currentState = .failed(message: "Connect headphones to play audio.")
-                    return
-                }
+
+            guard await self.activateSession() else {
+                self.finish(id, failure: "Connect headphones to play audio.")
+                return
             }
-            guard self.isCurrent(generation) else { return }
-            await self.loadAndPlayAsync(url: url, generation: generation)
+            guard self.isCurrent(id) else { return }
+
+            guard let url = self.resolveURL(for: item) else {
+                self.finish(id, failure: "This track isn't available offline.")
+                return
+            }
+
+            let asset = AVURLAsset(url: url)
+            let isPlayable = (try? await asset.load(.isPlayable)) ?? false
+            guard self.isCurrent(id) else { return }
+            guard isPlayable else {
+                self.finish(id, failure: "This track can't be played.")
+                return
+            }
+
+            let playerItem = AVPlayerItem(asset: asset)
+            self.player.replaceCurrentItem(with: playerItem)
+
+            // Wait for the item to actually be ready before asking it to play.
+            // `play()` against a `.unknown` item is a request the player is
+            // free to drop, which is what produced "spinner, then play button,
+            // no audio" — the manual tap afterwards only worked because by
+            // then the item had become ready on its own.
+            let ready = await self.waitUntilReadyToPlay(playerItem)
+            guard self.isCurrent(id) else { return }
+            guard ready else {
+                self.finish(id, failure: playerItem.error?.localizedDescription ?? "This track can't be played.")
+                return
+            }
+
+            self.player.play()
+            self.finish(id, failure: nil)
+            self.logPlaybackAttempt(index: index)
         }
     }
 
-    // MARK: - Interruption-driven pause/resume
-
-    private func pauseForInterruption() {
-        wasPlayingBeforeInterruption = (currentState == .playing)
-        player.pause()
+    /// Bounded wait for `AVPlayerItem.status` to leave `.unknown`.
+    ///
+    /// This is a local readiness wait during an explicit, user-initiated load
+    /// — not a background poll (soul.md §2.1) — and it is capped so a wedged
+    /// item surfaces as a failure instead of an endless spinner.
+    private func waitUntilReadyToPlay(_ item: AVPlayerItem) async -> Bool {
+        for _ in 0..<Self.readinessPollAttempts {
+            switch item.status {
+            case .readyToPlay: return true
+            case .failed: return false
+            case .unknown: break
+            @unknown default: break
+            }
+            try? await Task.sleep(for: .milliseconds(50))
+            if Task.isCancelled { return false }
+        }
+        log.error("Item never became ready to play")
+        return false
     }
 
-    private func resumeIfWasPlaying() {
-        guard wasPlayingBeforeInterruption else { return }
-        wasPlayingBeforeInterruption = false
-        ensureAudioSessionActive()
-        player.play()
+    /// 50 ms x 200 = a 10 second ceiling.
+    private static let readinessPollAttempts = 200
+
+    /// One line describing why the player is or isn't playing.
+    /// `reasonForWaitingToPlay` is the property that actually explains a
+    /// player that accepted `play()` and then sat still.
+    private func logPlaybackAttempt(index: Int) {
+        let session = AVAudioSession.sharedInstance()
+        let route = session.currentRoute.outputs.map(\.portType.rawValue).joined(separator: ",")
+        log.notice("""
+            play() index=\(index) \
+            timeControl=\(self.player.timeControlStatus.rawValue) \
+            waitingReason=\(self.player.reasonForWaitingToPlay?.rawValue ?? "none", privacy: .public) \
+            itemStatus=\(self.player.currentItem?.status.rawValue ?? -1) \
+            rate=\(self.player.rate) \
+            route=\(route.isEmpty ? "none" : route, privacy: .public)
+            """)
     }
 
-    // MARK: - KVO + NotificationCenter wiring
+    /// The single supersession check. A load that is no longer current must
+    /// not touch engine state.
+    private func isCurrent(_ id: Int) -> Bool {
+        !Task.isCancelled && loadID == id
+    }
 
-    /// Attaches KVO/notification observers for `item`, all scoped to
-    /// `generation` — the play attempt that loaded this item. Every handler
-    /// re-checks `isCurrent(generation)` before mutating shared state, so an
-    /// observer left firing from an abandoned attempt (cooperative
-    /// cancellation does not silence KVO callbacks) is a guaranteed no-op
-    /// rather than a race on whichever attempt's callback happens to land
-    /// last.
-    private func attachObservers(to item: AVPlayerItem, generation: Int) {
-        timeControlStatusObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] playerRef, _ in
-            let status = playerRef.timeControlStatus
-            Task { @MainActor [weak self] in
-                self?.handleTimeControlStatusChange(status, generation: generation)
+    /// Clears the preparing flag for `id` only. Guarding on the id matters: a
+    /// superseded load unwinds *after* its replacement has already set
+    /// `isPreparing`, and clearing it unguarded would hide the new load's
+    /// spinner while it was still working.
+    private func finish(_ id: Int, failure: String?) {
+        guard loadID == id else { return }
+        isPreparing = false
+        failureMessage = failure
+        if let failure {
+            log.error("Load failed: \(failure, privacy: .public)")
+        }
+    }
+
+    /// A completed download wins over the network; a track with no local file
+    /// and no credentials has nowhere to play from.
+    private func resolveURL(for item: QueueItem) -> URL? {
+        if let local = localFileURL(trackId: item.trackId) { return local }
+        guard !item.serverURL.isEmpty, !item.accessToken.isEmpty else { return nil }
+        return JellyfinAPIClient.streamingURL(
+            serverURL: item.serverURL,
+            accessToken: item.accessToken,
+            trackId: item.trackId
+        )
+    }
+
+    private func localFileURL(trackId: String) -> URL? {
+        guard let modelContext else { return nil }
+        let completed = BetaDownloadStatus.completed.rawValue
+        let predicate = #Predicate<BetaDownloadItem> {
+            $0.jellyfinId == trackId && $0.statusRaw == completed
+        }
+        guard let row = try? modelContext.fetch(FetchDescriptor(predicate: predicate)).first,
+              let fileName = row.localFileName else { return nil }
+
+        let url = BetaDownloadManager.downloadsDirectory.appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            row.statusRaw = BetaDownloadStatus.failed.rawValue
+            row.lastError = "File missing from disk"
+            try? modelContext.save()
+            return nil
+        }
+        return url
+    }
+
+    // MARK: - Audio session
+
+    /// `.longFormAudio` on watchOS must be activated with `activate()` —
+    /// `setActive(_:)` is not supported for that policy and throws — and
+    /// activation completes only once an output route exists, which on a cold
+    /// launch genuinely takes a moment.
+    private func activateSession() async -> Bool {
+        if isSessionActive { return true }
+        if let activationTask { return await activationTask.value }
+
+        let task = Task { @MainActor () -> Bool in
+            do {
+                try AVAudioSession.sharedInstance().setCategory(
+                    .playback, mode: .default, policy: .longFormAudio, options: []
+                )
+                try await AVAudioSession.sharedInstance().activate()
+                return true
+            } catch {
+                log.error("Audio session activation failed: \(error.localizedDescription, privacy: .public)")
+                return false
             }
         }
-
-        itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] itemRef, _ in
-            let status = itemRef.status
-            Task { @MainActor [weak self] in
-                self?.handleItemStatusChange(status, generation: generation)
-            }
-        }
-
-        didPlayToEndTimeToken = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.handleDidPlayToEndTime(generation: generation)
-            }
-        }
-
-        failedToPlayToEndTimeToken = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemFailedToPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self] note in
-            let errorDescription = (note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?.localizedDescription
-            Task { @MainActor [weak self] in
-                self?.handleFailedToPlayToEndTime(errorDescription: errorDescription, generation: generation)
-            }
-        }
+        activationTask = task
+        let activated = await task.value
+        activationTask = nil
+        isSessionActive = activated
+        return activated
     }
 
-    private func tearDownObservers() {
-        timeControlStatusObservation?.invalidate()
-        timeControlStatusObservation = nil
-
-        itemStatusObservation?.invalidate()
-        itemStatusObservation = nil
-
-        if let didPlayToEndTimeToken {
-            NotificationCenter.default.removeObserver(didPlayToEndTimeToken)
-            self.didPlayToEndTimeToken = nil
-        }
-
-        if let failedToPlayToEndTimeToken {
-            NotificationCenter.default.removeObserver(failedToPlayToEndTimeToken)
-            self.failedToPlayToEndTimeToken = nil
-        }
-    }
-
-    private func registerInterruptionObserver() {
-        interruptionToken = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.interruptionNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            let typeValue = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-            let optionsValue = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt
-            Task { @MainActor [weak self] in
-                self?.handleInterruption(typeValue: typeValue, optionsValue: optionsValue)
-            }
-        }
-    }
-
-    private func registerRouteChangeObserver() {
-        routeChangeToken = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.routeChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            let reasonValue = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
-            Task { @MainActor [weak self] in
-                self?.handleRouteChange(reasonValue: reasonValue)
-            }
-        }
-    }
-
-    // MARK: - Callback handlers
-
-    private func handleTimeControlStatusChange(_ status: AVPlayer.TimeControlStatus, generation: Int) {
-        guard isCurrent(generation) else { return }
-        switch status {
-        case .playing:
-            currentState = .playing
-        case .waitingToPlayAtSpecifiedRate:
-            if currentState != .loadingItem(trackId: currentTrackId ?? "") {
-                currentState = .buffering
-            }
-        case .paused:
-            if case .readyToPlay = itemReadyState {
-                currentState = .paused
-            } else if case .playing = currentState {
-                currentState = .paused
-            }
-        @unknown default:
-            break
-        }
-    }
-
-    private var itemReadyState: AVPlayerItem.Status {
-        currentItem?.status ?? .unknown
-    }
-
-    private func handleItemStatusChange(_ status: AVPlayerItem.Status, generation: Int) {
-        guard isCurrent(generation) else { return }
-        switch status {
-        case .readyToPlay:
-            if currentState != .playing {
-                currentState = .readyToPlay
-            }
-        case .failed:
-            let message = currentItem?.error?.localizedDescription ?? "Playback failed."
-            currentState = .failed(message: message)
-            advanceToNextOnFailure()
-        case .unknown:
-            break
-        @unknown default:
-            break
-        }
-    }
-
-    private func handleDidPlayToEndTime(generation: Int) {
-        guard isCurrent(generation) else { return }
-        if !queue.isEmpty, let currentTrackId,
-           let currentIndex = queue.firstIndex(where: { $0.trackId == currentTrackId }) {
-            let nextIndex = currentIndex + 1
-            if nextIndex < queue.count {
-                playQueueItem(at: nextIndex)
-            } else if isShuffleEnabled {
-                queue = shuffled(originalQueue, pinningTrackId: nil)
-                if !queue.isEmpty {
-                    playQueueItem(at: 0)
-                } else {
-                    currentState = .finishedTrack
-                }
-            } else {
-                playQueueItem(at: 0)
-            }
-        } else {
-            currentState = .finishedTrack
-        }
-    }
-
-    private func handleFailedToPlayToEndTime(errorDescription: String?, generation: Int) {
-        guard isCurrent(generation) else { return }
-        let message = errorDescription ?? "Playback failed before reaching the end of the track."
-        currentState = .failed(message: message)
-        advanceToNextOnFailure()
-    }
-
-    private func handleInterruption(typeValue: UInt?, optionsValue: UInt?) {
-        guard let typeValue, let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
+    /// Runs `work` with a live audio session, activating first if needed.
+    private func withActiveSession(_ work: @escaping @MainActor () -> Void) {
+        if isSessionActive {
+            work()
             return
         }
-
-        switch type {
-        case .began:
-            pauseForInterruption()
-        case .ended:
-            if let optionsValue,
-               AVAudioSession.InterruptionOptions(rawValue: optionsValue).contains(.shouldResume) {
-                resumeIfWasPlaying()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if await self.activateSession() {
+                work()
+            } else {
+                self.failureMessage = "Connect headphones to play audio."
             }
-        @unknown default:
-            break
         }
     }
 
-    private func handleRouteChange(reasonValue: UInt?) {
-        guard let reasonValue,
-              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
+    // MARK: - Observers
+    //
+    // Registered once, for the lifetime of the engine. Nothing is attached per
+    // item, so nothing needs tearing down between tracks — which is what the
+    // old generation guards existed to make safe.
 
-        if reason == .oldDeviceUnavailable {
-            if currentState == .playing {
-                pause()
+    private func registerObservers() {
+        didPlayToEndToken = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main
+        ) { [weak self] note in
+            // Read off the notification before hopping isolation: `Notification`
+            // is not `Sendable`, so it must not cross into the closure below.
+            let finished = note.object as? AVPlayerItem
+            MainActor.assumeIsolated {
+                guard let self, let finished,
+                      finished === self.player.currentItem else { return }
+                log.notice("AVPlayerItemDidPlayToEndTime fired at time=\(self.currentTime)")
+                self.advanceToNext()
             }
+        }
+
+        interruptionToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let type = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt)
+                .flatMap(AVAudioSession.InterruptionType.init(rawValue:))
+            let shouldResume = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
+                .map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? false
+            Task { @MainActor [weak self] in
+                self?.handleInterruption(type: type, shouldResume: shouldResume)
+            }
+        }
+
+        routeChangeToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt)
+                .flatMap(AVAudioSession.RouteChangeReason.init(rawValue:))
+            Task { @MainActor [weak self] in
+                guard reason == .oldDeviceUnavailable else { return }
+                self?.pause()
+            }
+        }
+    }
+
+    private func handleInterruption(type: AVAudioSession.InterruptionType?, shouldResume: Bool) {
+        switch type {
+        case .began:
+            wasPlayingBeforeInterruption = (currentState == .playing)
+            player.pause()
+        case .ended:
+            guard wasPlayingBeforeInterruption else { return }
+            wasPlayingBeforeInterruption = false
+            // The system tore the session down; it has to come back up before
+            // the player has anywhere to output.
+            isSessionActive = false
+            guard shouldResume else { return }
+            withActiveSession { [weak self] in self?.player.play() }
+        default:
+            break
         }
     }
 }

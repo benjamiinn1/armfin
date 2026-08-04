@@ -8,7 +8,6 @@ struct TrackListView: View {
     @Environment(\.nowPlayingManager) private var nowPlayingManager
     @Environment(\.showNowPlaying) private var showNowPlaying
 
-    private let apiClient = JellyfinAPIClient()
 
     init(serverURL: String, userId: String, accessToken: String, albumId: String, albumName: String, artistName: String) {
         _viewModel = State(
@@ -144,7 +143,9 @@ struct TrackListView: View {
                 durationSeconds: Double(t.durationTicks) / 10_000_000,
                 serverURL: viewModel.serverURL,
                 accessToken: viewModel.accessToken,
-                artworkURL: trackArtworkURL(t)
+                artworkURL: trackArtworkURL(t),
+                indexNumber: t.indexNumber,
+                discNumber: t.discNumber
             )
         }
         playbackEngine.setQueue(queueItems, startingAt: nowPlaying.trackId)
@@ -156,7 +157,9 @@ struct TrackListView: View {
                 albumName: item.albumName,
                 albumId: item.albumId,
                 durationSeconds: item.durationSeconds,
-                artworkURL: item.artworkURL
+                artworkURL: item.artworkURL,
+                indexNumber: item.indexNumber,
+                discNumber: item.discNumber
             ))
         }
         playbackEngine.play(
@@ -181,7 +184,9 @@ struct TrackListView: View {
                 artistName: viewModel.artistName,
                 albumName: viewModel.albumName,
                 albumId: track.albumId ?? "",
-                durationTicks: track.durationTicks
+                durationTicks: track.durationTicks,
+                indexNumber: track.indexNumber,
+                discNumber: track.discNumber
             ))
         }
     }
@@ -219,13 +224,15 @@ struct TrackListView: View {
             albumName: viewModel.albumName,
             albumId: track.albumId,
             durationSeconds: Double(track.durationTicks) / 10_000_000,
-            artworkURL: trackArtworkURL(track)
+            artworkURL: trackArtworkURL(track),
+            indexNumber: track.indexNumber,
+            discNumber: track.discNumber
         )
     }
 
     private func trackArtworkURL(_ track: JellyfinAPIClient.TrackSummary) -> URL? {
         let itemId = track.albumId ?? track.id
-        return apiClient.imageURL(
+        return JellyfinAPIClient.imageURL(
             serverURL: viewModel.serverURL,
             itemId: itemId,
             maxWidth: 200,

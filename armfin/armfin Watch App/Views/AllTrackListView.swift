@@ -11,7 +11,6 @@ struct AllTrackListView: View {
     private let serverURL: String
     private let userId: String
     private let accessToken: String
-    private let apiClient = JellyfinAPIClient()
 
     init(serverURL: String, userId: String, accessToken: String) {
         self.serverURL = serverURL
@@ -60,12 +59,9 @@ struct AllTrackListView: View {
             }
 
             if viewModel.hasMore {
-                ProgressView()
-                    .frame(maxWidth: .infinity)
-                    .listRowBackground(Color.clear)
-                    .onAppear {
-                        Task { await viewModel.loadMore() }
-                    }
+                PaginationFooter(errorMessage: viewModel.loadMoreError) {
+                    await viewModel.loadMore()
+                }
             }
         }
         .listStyle(.plain)
@@ -142,7 +138,9 @@ struct AllTrackListView: View {
                 durationSeconds: Double(t.durationTicks) / 10_000_000,
                 serverURL: serverURL,
                 accessToken: accessToken,
-                artworkURL: trackArtworkURL(t)
+                artworkURL: trackArtworkURL(t),
+                indexNumber: t.indexNumber,
+                discNumber: t.discNumber
             )
         }
         playbackEngine.setQueue(queueItems, startingAt: nowPlaying.trackId)
@@ -154,7 +152,9 @@ struct AllTrackListView: View {
                 albumName: item.albumName,
                 albumId: item.albumId,
                 durationSeconds: item.durationSeconds,
-                artworkURL: item.artworkURL
+                artworkURL: item.artworkURL,
+                indexNumber: item.indexNumber,
+                discNumber: item.discNumber
             ))
         }
         playbackEngine.play(
@@ -179,7 +179,9 @@ struct AllTrackListView: View {
                 artistName: track.artistName ?? "",
                 albumName: track.albumName ?? "",
                 albumId: track.albumId ?? "",
-                durationTicks: track.durationTicks
+                durationTicks: track.durationTicks,
+                indexNumber: track.indexNumber,
+                discNumber: track.discNumber
             ))
         }
     }
@@ -217,13 +219,15 @@ struct AllTrackListView: View {
             albumName: track.albumName ?? "",
             albumId: track.albumId,
             durationSeconds: Double(track.durationTicks) / 10_000_000,
-            artworkURL: trackArtworkURL(track)
+            artworkURL: trackArtworkURL(track),
+            indexNumber: track.indexNumber,
+            discNumber: track.discNumber
         )
     }
 
     private func trackArtworkURL(_ track: JellyfinAPIClient.TrackSummary) -> URL? {
         let itemId = track.albumId ?? track.id
-        return apiClient.imageURL(
+        return JellyfinAPIClient.imageURL(
             serverURL: serverURL,
             itemId: itemId,
             maxWidth: 60,

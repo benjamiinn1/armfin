@@ -32,7 +32,23 @@ final class BrowseViewModel {
     private(set) var totalCount: Int = 0
     private(set) var isLoadingMore: Bool = false
 
-    var hasMore: Bool { artists.count < totalCount }
+    /// Driven by how many rows the server has handed back, not how many are
+    /// on screen. `appendUnique` can drop duplicates, and a `hasMore` pinned
+    /// to the displayed count would then stay true forever, re-requesting the
+    /// same overlapping page on every scroll.
+    var hasMore: Bool { !reachedEnd && fetchedCount < totalCount }
+
+    /// Server-side offset for the next page.
+    private var fetchedCount = 0
+
+    /// Set when a page comes back empty, so a `totalCount` that disagrees with
+    /// what the server will actually return can't drive an endless loop.
+    private var reachedEnd = false
+
+    /// Non-nil when the last `loadMore` failed. The list footer renders it as
+    /// a retry row — swallowing the error left an indistinguishable spinner
+    /// spinning forever (soul.md §4.3).
+    private(set) var loadMoreError: String?
 
     private let apiClient: JellyfinAPIClient
     private let serverURL: String
@@ -60,6 +76,9 @@ final class BrowseViewModel {
         state = .loading
         artists = []
         totalCount = 0
+        fetchedCount = 0
+        reachedEnd = false
+        loadMoreError = nil
 
         do {
             let libId = try await apiClient.fetchMusicLibraryId(
@@ -78,7 +97,8 @@ final class BrowseViewModel {
                 limit: pageSize
             )
 
-            artists = result.items
+            appendUnique(result.items)
+            fetchedCount = result.items.count
             totalCount = result.totalRecordCount
             state = .loaded
         } catch let error as JellyfinAPIClientError {
@@ -92,6 +112,7 @@ final class BrowseViewModel {
     func loadMore() async {
         guard !isLoadingMore, hasMore, let libId = musicLibraryId else { return }
         isLoadingMore = true
+        loadMoreError = nil
 
         do {
             let result = try await apiClient.fetchArtists(
@@ -99,18 +120,40 @@ final class BrowseViewModel {
                 userId: userId,
                 accessToken: accessToken,
                 musicLibraryId: libId,
-                startIndex: artists.count,
+                startIndex: fetchedCount,
                 limit: pageSize
             )
 
-            artists.append(contentsOf: result.items)
+            appendUnique(result.items)
+            fetchedCount += result.items.count
             totalCount = result.totalRecordCount
+            if result.items.isEmpty { reachedEnd = true }
         } catch {
-            // Silently fail on load-more — existing items remain visible.
-            // The user can scroll down again to retry.
+            loadMoreError = "Couldn't load more artists"
         }
 
         isLoadingMore = false
+    }
+
+    /// Appends only ids not already present. Jellyfin's recursive `/Items`
+    /// queries can hand back a row that was already returned — the same entity
+    /// reached by more than one path, or a page boundary shifting under a
+    /// non-unique `SortBy` — and `ForEach` renders that as a visible duplicate.
+    /// Guarding on id is correct whichever of those is happening.
+    private func appendUnique(_ incoming: [JellyfinAPIClient.ArtistSummary]) {
+        var seenIds = Set(artists.map(\.id))
+        var seenNames = Set(artists.map { $0.name.lowercased() })
+        for item in incoming {
+            let name = item.name.lowercased()
+            // Name is a second key here, not just id. `/Artists` is expected to
+            // collapse same-name artists server-side; this is a belt-and-braces
+            // fallback for a server that doesn't, added because duplicates
+            // survived id-only de-duping. Safe for a personal library — two
+            // genuinely different artists sharing a name would merge, so drop
+            // this clause if that ever matters.
+            guard seenIds.insert(item.id).inserted, seenNames.insert(name).inserted else { continue }
+            artists.append(item)
+        }
     }
 
     private func browseError(for error: JellyfinAPIClientError) -> BrowseError {

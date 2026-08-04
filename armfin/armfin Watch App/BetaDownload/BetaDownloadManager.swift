@@ -11,10 +11,53 @@ struct TrackInfo: Sendable {
     let albumName: String
     let albumId: String
     let durationTicks: Int64
+    /// Jellyfin's `IndexNumber` / `ParentIndexNumber`. Optional at every layer
+    /// because not every source is tagged with them.
+    var indexNumber: Int? = nil
+    var discNumber: Int? = nil
 }
 
 enum AlbumDownloadState {
     case none, downloading, partial, completed, mixed
+}
+
+/// Live byte counts for one in-flight download.
+struct DownloadProgress: Sendable, Equatable {
+    let downloadedBytes: Int64
+
+    /// `nil` when the server sent no `Content-Length`. armfin asks Jellyfin to
+    /// transcode to AAC on the fly, so the response is chunked and the total
+    /// size is genuinely unknowable up front — `totalBytesExpectedToWrite`
+    /// arrives as `NSURLSessionTransferSizeUnknown`. This is why a percentage
+    /// ring could never move: it wasn't stuck, there was no denominator.
+    let totalBytes: Int64?
+
+    /// How full to draw the ring, `nil` if there's no usable denominator.
+    ///
+    /// `expectedBytes` is normally the estimate from `estimatedBytes(forDurationSeconds:)`
+    /// rather than a real `Content-Length`, so this is approximate by nature.
+    /// It's capped just below full: an estimate that runs short would
+    /// otherwise park the ring at 100% while bytes were still arriving, which
+    /// reads as finished-but-stuck. The row disappears on completion, so the
+    /// last sliver is never something the user waits on.
+    func fraction(expectedBytes: Int64) -> Double? {
+        let denominator = totalBytes ?? expectedBytes
+        guard denominator > 0 else { return nil }
+        return min(Double(downloadedBytes) / Double(denominator), 0.99)
+    }
+
+    /// Estimated finished size of a transcoded track: duration x the bitrate
+    /// armfin asks Jellyfin for. Jellyfin transcodes on the fly, so the
+    /// response is chunked and carries no `Content-Length` — without this
+    /// there is no denominator and no ring can be drawn at all.
+    ///
+    /// Constant-bitrate AAC makes duration x bitrate a close estimate.
+    /// Returns 0 when the duration is unknown, which callers treat as
+    /// "no ring".
+    static func estimatedBytes(forDurationSeconds seconds: Double) -> Int64 {
+        guard seconds > 0 else { return 0 }
+        return Int64(seconds * Double(JellyfinAPIClient.transcodeBitrateBitsPerSecond) / 8)
+    }
 }
 
 @Observable
@@ -54,8 +97,30 @@ final class BetaDownloadManager: NSObject {
     @ObservationIgnored
     private var activeTaskIds: Set<String> = []
 
+    /// Last progress write per in-flight download. Keyed by track id because a
+    /// single shared timestamp meant the 1-second throttle was global: with up
+    /// to `maxConcurrentTasks` downloads running, whichever delegate callback
+    /// won the race each second was the only row that updated, and the other
+    /// five showed stale byte counts and frozen progress rings.
+    ///
+    /// Bounded by `maxConcurrentTasks` — entries are always released together
+    /// with `activeTaskIds` via `releaseTask` (soul.md §1.2).
     @ObservationIgnored
-    private var lastProgressUpdate: Date = .distantPast
+    private var lastProgressUpdate: [String: Date] = [:]
+
+    /// Live progress for in-flight downloads, keyed by track id.
+    ///
+    /// Deliberately observed (not `@ObservationIgnored`) — the UI reads it —
+    /// and deliberately NOT persisted. Writing byte counts to SwiftData meant
+    /// up to `maxConcurrentTasks` saves per second, and every save invalidates
+    /// every `@Query`, which re-ran the grouping and sorting behind the whole
+    /// Downloads list several times a second. Progress is ephemeral: a
+    /// download that doesn't survive relaunch restarts its own counter, and
+    /// `BetaDownloadItem.status` (which does persist) is what actually needs
+    /// to be durable.
+    ///
+    /// Bounded by `maxConcurrentTasks` — released in `releaseTask`.
+    private(set) var progressByTrackId: [String: DownloadProgress] = [:]
 
     @ObservationIgnored
     private let apiClient = JellyfinAPIClient()
@@ -211,6 +276,8 @@ final class BetaDownloadManager: NSObject {
             artistName: track.artistName,
             albumName: track.albumName,
             albumId: track.albumId,
+            indexNumber: track.indexNumber,
+            discNumber: track.discNumber,
             status: .queued,
             durationTicks: track.durationTicks
         )
@@ -229,7 +296,7 @@ final class BetaDownloadManager: NSObject {
                     task.cancel()
                 }
             }
-            activeTaskIds.remove(jellyfinId)
+            releaseTask(jellyfinId)
         }
 
         let predicate = #Predicate<BetaDownloadItem> { $0.jellyfinId == jellyfinId }
@@ -251,7 +318,7 @@ final class BetaDownloadManager: NSObject {
         session.getActiveTasks { tasks in
             for task in tasks { task.cancel() }
         }
-        activeTaskIds.removeAll()
+        releaseAllTasks()
 
         let descriptor = FetchDescriptor<BetaDownloadItem>()
         if let items = try? modelContext.fetch(descriptor) {
@@ -335,7 +402,9 @@ final class BetaDownloadManager: NSObject {
                 artistName: track.artistName ?? artistName,
                 albumName: track.albumName ?? albumName,
                 albumId: track.albumId ?? albumId,
-                durationTicks: track.durationTicks
+                durationTicks: track.durationTicks,
+                indexNumber: track.indexNumber,
+                discNumber: track.discNumber
             ))
         }
     }
@@ -350,7 +419,7 @@ final class BetaDownloadManager: NSObject {
         for item in items {
             if item.status == .downloading, activeTaskIds.contains(item.jellyfinId) {
                 idsToCancel.append(item.jellyfinId)
-                activeTaskIds.remove(item.jellyfinId)
+                releaseTask(item.jellyfinId)
             }
             if let fileName = item.localFileName {
                 let fileURL = Self.betaDownloadsDirectory.appendingPathComponent(fileName)
@@ -401,6 +470,21 @@ final class BetaDownloadManager: NSObject {
 
     // MARK: - Internal queue management
 
+    /// Releases every piece of per-task state for `jellyfinId` at once. Single
+    /// entry point so a task can never leave `activeTaskIds` while leaving its
+    /// throttle timestamp behind (soul.md §4.1).
+    private func releaseTask(_ jellyfinId: String) {
+        activeTaskIds.remove(jellyfinId)
+        lastProgressUpdate[jellyfinId] = nil
+        progressByTrackId[jellyfinId] = nil
+    }
+
+    private func releaseAllTasks() {
+        activeTaskIds.removeAll()
+        lastProgressUpdate.removeAll()
+        progressByTrackId.removeAll()
+    }
+
     /// Fills available download slots by handing queued items to the system
     /// daemon. Up to `maxConcurrentTasks` are in-flight simultaneously.
     /// The daemon manages these independently of our app's lifecycle —
@@ -433,7 +517,7 @@ final class BetaDownloadManager: NSObject {
         }
 
         for item in nextItems {
-            guard let url = apiClient.betaDownloadURL(
+            guard let url = JellyfinAPIClient.betaDownloadURL(
                 serverURL: serverURL,
                 accessToken: accessToken,
                 trackId: item.jellyfinId
@@ -495,7 +579,7 @@ extension BetaDownloadManager: URLSessionDownloadDelegate {
         if (error as NSError).code == NSURLErrorCancelled {
             log.notice("Download cancelled for \(jellyfinId)")
             Task { @MainActor [weak self] in
-                self?.activeTaskIds.remove(jellyfinId)
+                self?.releaseTask(jellyfinId)
                 self?.fillDownloadSlots()
             }
             return
@@ -540,7 +624,7 @@ extension BetaDownloadManager: URLSessionDownloadDelegate {
             }
         }
 
-        activeTaskIds.remove(jellyfinId)
+        releaseTask(jellyfinId)
         fillDownloadSlots()
     }
 
@@ -561,7 +645,7 @@ extension BetaDownloadManager: URLSessionDownloadDelegate {
         let destination = Self.artworkFileURL(forAlbumId: albumId)
         guard !FileManager.default.fileExists(atPath: destination.path) else { return }
 
-        guard let url = apiClient.imageURL(
+        guard let url = JellyfinAPIClient.imageURL(
             serverURL: serverURL,
             itemId: albumId,
             maxWidth: 200,
@@ -609,23 +693,22 @@ extension BetaDownloadManager: URLSessionDownloadDelegate {
             try? modelContext.save()
         }
 
-        activeTaskIds.remove(jellyfinId)
+        releaseTask(jellyfinId)
         fillDownloadSlots()
     }
 
+    /// Records progress in memory only — no fetch, no `save()`. See
+    /// `progressByTrackId` for why this must not touch the store.
     private func handleProgress(jellyfinId: String, written: Int64, total: Int64) {
         let now = Date()
-        guard now.timeIntervalSince(lastProgressUpdate) >= 1.0 else { return }
-        lastProgressUpdate = now
+        let last = lastProgressUpdate[jellyfinId] ?? .distantPast
+        guard now.timeIntervalSince(last) >= 1.0 else { return }
+        lastProgressUpdate[jellyfinId] = now
 
-        guard let modelContext else { return }
-
-        let predicate = #Predicate<BetaDownloadItem> { $0.jellyfinId == jellyfinId }
-        if let item = try? modelContext.fetch(FetchDescriptor(predicate: predicate)).first {
-            item.downloadedBytes = written
-            item.totalBytes = total
-            try? modelContext.save()
-        }
+        progressByTrackId[jellyfinId] = DownloadProgress(
+            downloadedBytes: written,
+            totalBytes: total > 0 ? total : nil
+        )
     }
 }
 

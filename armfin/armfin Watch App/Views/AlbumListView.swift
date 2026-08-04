@@ -16,7 +16,6 @@ struct AlbumListView: View {
 
     @State private var isLoadingShuffle = false
 
-    private let apiClient = JellyfinAPIClient()
 
     init(serverURL: String, userId: String, accessToken: String, artistId: String, artistName: String) {
         self.serverURL = serverURL
@@ -69,12 +68,9 @@ struct AlbumListView: View {
             }
 
             if viewModel.hasMore {
-                ProgressView()
-                    .frame(maxWidth: .infinity)
-                    .listRowBackground(Color.clear)
-                    .onAppear {
-                        Task { await viewModel.loadMore() }
-                    }
+                PaginationFooter(errorMessage: viewModel.loadMoreError) {
+                    await viewModel.loadMore()
+                }
             }
         }
         .listStyle(.plain)
@@ -113,7 +109,7 @@ struct AlbumListView: View {
         var queueItems: [QueueItem] = []
 
         for album in viewModel.albums {
-            if let result = try? await apiClient.fetchTracks(
+            if let result = try? await JellyfinAPIClient.shared.fetchTracks(
                 serverURL: serverURL,
                 userId: userId,
                 accessToken: accessToken,
@@ -130,7 +126,7 @@ struct AlbumListView: View {
                         durationSeconds: Double(t.durationTicks) / 10_000_000,
                         serverURL: serverURL,
                         accessToken: accessToken,
-                        artworkURL: apiClient.imageURL(
+                        artworkURL: JellyfinAPIClient.imageURL(
                             serverURL: serverURL,
                             itemId: itemId,
                             maxWidth: 200,
@@ -191,7 +187,7 @@ struct AlbumListView: View {
             } label: {
                 HStack(spacing: 10) {
                     JellyfinImage(
-                        url: apiClient.imageURL(
+                        url: JellyfinAPIClient.imageURL(
                             serverURL: serverURL,
                             itemId: album.id,
                             maxWidth: 56,

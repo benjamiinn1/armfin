@@ -69,6 +69,16 @@ enum JellyfinAPIClientError: Error, Equatable {
 /// - `/Audio/{Id}/universal` URL builder — adaptive/transcoded streaming (§2.1, §2.4).
 struct JellyfinAPIClient: Sendable {
 
+    /// Shared instance for callers that make real requests.
+    ///
+    /// The default `init` builds a `URLSession`, and a SwiftUI `View` struct is
+    /// re-initialised on every parent body pass — so a view holding
+    /// `private let apiClient = JellyfinAPIClient()` was creating (and never
+    /// invalidating) a session per pass. Views that only need to *build* a URL
+    /// should call the static builders below and hold no client at all; views
+    /// that genuinely fetch use this.
+    static let shared = JellyfinAPIClient()
+
     // MARK: - Decoded response shapes (private to this file, not SwiftData models)
 
     /// Minimal decode of `/System/Info/Public`. Only `ServerName` is consumed
@@ -344,7 +354,7 @@ struct JellyfinAPIClient: Sendable {
     /// returning `false`, so call sites can distinguish "unreachable" from
     /// "reachable but rejected" if needed later.
     func validateServer(serverURL: String) async throws -> Bool {
-        let url = try endpointURL(serverURL: serverURL, path: "/System/Info/Public")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/System/Info/Public")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         applyCommonHeaders(to: &request, accessToken: nil)
@@ -360,7 +370,7 @@ struct JellyfinAPIClient: Sendable {
     /// per §2.2's request shape, returning the decoded user id, username,
     /// access token, and server id on success.
     func authenticate(serverURL: String, username: String, password: String) async throws -> AuthenticationResult {
-        let url = try endpointURL(serverURL: serverURL, path: "/Users/AuthenticateByName")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Users/AuthenticateByName")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -420,7 +430,7 @@ struct JellyfinAPIClient: Sendable {
     /// map that to a "Quick Connect unavailable" message rather than this
     /// client pre-checking `/QuickConnect/Enabled` separately.
     func initiateQuickConnect(serverURL: String) async throws -> QuickConnectInitiateResult {
-        let url = try endpointURL(serverURL: serverURL, path: "/QuickConnect/Initiate")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/QuickConnect/Initiate")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         applyCommonHeaders(to: &request, accessToken: nil)
@@ -436,7 +446,7 @@ struct JellyfinAPIClient: Sendable {
     /// bounded retry cadence (see `LoginViewModel.runQuickConnectFlow`).
     /// Returns `true` once the code has been approved from another device.
     func checkQuickConnectApproved(serverURL: String, secret: String) async throws -> Bool {
-        let url = try endpointURL(serverURL: serverURL, path: "/QuickConnect/Connect")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/QuickConnect/Connect")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components?.queryItems = [URLQueryItem(name: "secret", value: secret)]
 
@@ -459,7 +469,7 @@ struct JellyfinAPIClient: Sendable {
     /// shape as `/Users/AuthenticateByName`, so this reuses
     /// `AuthenticateByNameResponse` for decoding rather than duplicating it.
     func authenticateWithQuickConnect(serverURL: String, secret: String) async throws -> AuthenticationResult {
-        let url = try endpointURL(serverURL: serverURL, path: "/Users/AuthenticateWithQuickConnect")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Users/AuthenticateWithQuickConnect")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -493,7 +503,7 @@ struct JellyfinAPIClient: Sendable {
     /// Throws `.musicLibraryNotFound` rather than returning an empty/optional
     /// string if no music view exists on the server.
     func fetchMusicLibraryId(serverURL: String, userId: String, accessToken: String) async throws -> String {
-        let url = try endpointURL(serverURL: serverURL, path: "/Users/\(userId)/Views")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Users/\(userId)/Views")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         applyCommonHeaders(to: &request, accessToken: accessToken)
@@ -527,13 +537,22 @@ struct JellyfinAPIClient: Sendable {
         startIndex: Int = 0,
         limit: Int = 50
     ) async throws -> PagedResult<ArtistSummary> {
-        let url = try endpointURL(serverURL: serverURL, path: "/Items")
+        // `/Artists`, not `/Items?IncludeItemTypes=MusicArtist`.
+        //
+        // The `/Items` form returns raw `MusicArtist` rows, and a server can
+        // hold more than one for the same name — typically when a name appears
+        // both as an album artist and as a track-level artist, or when tags
+        // disagree across files. That surfaced in armfin as visibly duplicated
+        // artists which the Jellyfin web client never showed, because the web
+        // client browses artists through `/Artists`, which collapses them.
+        // Same `BaseItemDtoQueryResult` response shape, so decoding is
+        // unchanged.
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Artists")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components?.queryItems = [
-            URLQueryItem(name: "IncludeItemTypes", value: "MusicArtist"),
-            URLQueryItem(name: "Recursive", value: "true"),
             URLQueryItem(name: "ParentId", value: musicLibraryId),
             URLQueryItem(name: "SortBy", value: "SortName"),
+            URLQueryItem(name: "SortOrder", value: "Ascending"),
             URLQueryItem(name: "userId", value: userId),
             URLQueryItem(name: "StartIndex", value: String(startIndex)),
             URLQueryItem(name: "Limit", value: String(limit))
@@ -580,7 +599,7 @@ struct JellyfinAPIClient: Sendable {
         startIndex: Int = 0,
         limit: Int = 50
     ) async throws -> PagedResult<AlbumSummary> {
-        let url = try endpointURL(serverURL: serverURL, path: "/Items")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Items")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "IncludeItemTypes", value: "MusicAlbum"),
@@ -636,7 +655,7 @@ struct JellyfinAPIClient: Sendable {
         startIndex: Int = 0,
         limit: Int = 50
     ) async throws -> PagedResult<TrackSummary> {
-        let url = try endpointURL(serverURL: serverURL, path: "/Items")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Items")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "ParentId", value: albumId),
@@ -694,7 +713,7 @@ struct JellyfinAPIClient: Sendable {
         startIndex: Int = 0,
         limit: Int = 50
     ) async throws -> PagedResult<AlbumSummary> {
-        let url = try endpointURL(serverURL: serverURL, path: "/Items")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Items")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "IncludeItemTypes", value: "MusicAlbum"),
@@ -747,7 +766,7 @@ struct JellyfinAPIClient: Sendable {
         startIndex: Int = 0,
         limit: Int = 50
     ) async throws -> PagedResult<TrackSummary> {
-        let url = try endpointURL(serverURL: serverURL, path: "/Items")
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Items")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "IncludeItemTypes", value: "Audio"),
@@ -808,13 +827,13 @@ struct JellyfinAPIClient: Sendable {
     /// Returns `nil` rather than throwing if `serverURL` cannot be turned
     /// into a valid request URL — call sites already treat a missing
     /// streaming URL as "can't play this track right now".
-    func streamingURL(
+    static func streamingURL(
         serverURL: String,
         accessToken: String,
         trackId: String,
         preferDirectPlay: Bool = false
     ) -> URL? {
-        guard let url = try? endpointURL(serverURL: serverURL, path: "/Audio/\(trackId)/universal") else {
+        guard let url = try? Self.endpointURL(serverURL: serverURL, path: "/Audio/\(trackId)/universal") else {
             return nil
         }
 
@@ -843,7 +862,7 @@ struct JellyfinAPIClient: Sendable {
     /// capped to the rendered size (per soul.md §1: downsample on load).
     /// Appends `tag` when available for strong HTTP cache headers.
     /// Returns `nil` on a malformed `serverURL`.
-    func imageURL(
+    static func imageURL(
         serverURL: String,
         itemId: String,
         imageType: String = "Primary",
@@ -851,7 +870,7 @@ struct JellyfinAPIClient: Sendable {
         maxHeight: Int = 80,
         tag: String? = nil
     ) -> URL? {
-        guard let url = try? endpointURL(serverURL: serverURL, path: "/Items/\(itemId)/Images/\(imageType)") else {
+        guard let url = try? Self.endpointURL(serverURL: serverURL, path: "/Items/\(itemId)/Images/\(imageType)") else {
             return nil
         }
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
@@ -871,20 +890,27 @@ struct JellyfinAPIClient: Sendable {
     /// transcoding to AAC 128kbps stereo. Used by `BetaDownloadManager` to
     /// ensure predictable, small files land on the watch regardless of the
     /// source format (FLAC, WAV, high-bitrate AAC, etc.).
-    func betaDownloadURL(
+    /// Bitrate armfin asks Jellyfin to transcode to. Single source of truth:
+    /// the download URL below sends it, and `DownloadProgress` multiplies it
+    /// by a track's duration to estimate the finished size — which is the only
+    /// way to draw a progress ring, since a transcoded response is chunked and
+    /// carries no `Content-Length`.
+    static let transcodeBitrateBitsPerSecond = 128_000
+
+    static func betaDownloadURL(
         serverURL: String,
         accessToken: String,
         trackId: String
     ) -> URL? {
-        guard let url = try? endpointURL(serverURL: serverURL, path: "/Audio/\(trackId)/stream.aac") else {
+        guard let url = try? Self.endpointURL(serverURL: serverURL, path: "/Audio/\(trackId)/stream.aac") else {
             return nil
         }
 
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "audioCodec", value: "aac"),
-            URLQueryItem(name: "audioBitRate", value: "128000"),
-            URLQueryItem(name: "maxStreamingBitrate", value: "128000"),
+            URLQueryItem(name: "audioBitRate", value: String(transcodeBitrateBitsPerSecond)),
+            URLQueryItem(name: "maxStreamingBitrate", value: String(transcodeBitrateBitsPerSecond)),
             URLQueryItem(name: "maxAudioChannels", value: "2"),
             URLQueryItem(name: "static", value: "false"),
             URLQueryItem(name: "api_key", value: accessToken)
@@ -898,7 +924,7 @@ struct JellyfinAPIClient: Sendable {
     /// Builds the full endpoint URL from a user-entered server URL string and
     /// a fixed API path, surfacing malformed input as `.invalidURL` rather
     /// than force-unwrapping.
-    private func endpointURL(serverURL: String, path: String) throws -> URL {
+    private static func endpointURL(serverURL: String, path: String) throws -> URL {
         let trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw JellyfinAPIClientError.invalidURL

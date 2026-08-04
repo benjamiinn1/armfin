@@ -3,20 +3,22 @@ import SwiftData
 
 struct BetaDownloadsView: View {
     var serverURL: String = ""
-    var accessToken: String = ""
 
-    @Query(sort: \BetaDownloadItem.createdDate, order: .reverse)
+    /// Sorted by download time because the in-progress sections (Downloading,
+    /// Queue) are ordered work, and the queue's order is the order the manager
+    /// will actually process them in. The completed sections re-sort by name —
+    /// see `completedSongs` / `albums` / `artists`.
+    @Query(sort: \BetaDownloadItem.createdDate, order: .forward)
     private var allItems: [BetaDownloadItem]
 
     @Environment(\.playbackEngine) private var playbackEngine
     @Environment(\.nowPlayingManager) private var nowPlayingManager
     @Environment(\.showNowPlaying) private var showNowPlaying
 
-    @State private var itemPendingRemoval: BetaDownloadItem?
     @State private var showPurgeConfirmation = false
+    @State private var itemPendingRemoval: BetaDownloadItem?
     @State private var selectedTab: DownloadsTab = .songs
-
-    private let apiClient = JellyfinAPIClient()
+    @State private var startFailureMessage: String?
 
     enum DownloadsTab: String, CaseIterable {
         case artists = "Artists"
@@ -44,36 +46,49 @@ struct BetaDownloadsView: View {
         !downloadingItems.isEmpty || !queuedItems.isEmpty
     }
 
+    // MARK: - Completed, grouped and sorted for display
+
+    /// Alphabetical by title. `allItems` is ordered by download time, which is
+    /// meaningful for the queue but arbitrary for a finished library.
+    private var completedSongs: [BetaDownloadItem] {
+        completedItems.sortedByTitle()
+    }
+
+    private var albums: [DownloadedAlbumGroup] {
+        completedItems.groupedIntoAlbums()
+    }
+
+    /// An empty artist name is a legitimate group (every track Jellyfin gave no
+    /// artist for), unlike an empty album id — it's displayed as "Unknown
+    /// Artist" and still matches exactly on the drill-down's predicate.
+    private var artists: [(name: String, songCount: Int, albumCount: Int, artworkAlbumId: String?)] {
+        Dictionary(grouping: completedItems, by: \.artistName)
+            .map { artistName, tracks in
+                (
+                    name: artistName,
+                    songCount: tracks.count,
+                    albumCount: Set(tracks.map(\.albumId).filter { !$0.isEmpty }).count,
+                    artworkAlbumId: tracks.first(where: { !$0.albumId.isEmpty })?.albumId
+                )
+            }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
     var body: some View {
         Group {
             if allItems.isEmpty {
-                emptyState
+                DownloadsEmptyState(
+                    icon: "arrow.down.circle",
+                    title: "No downloads yet",
+                    detail: "Download songs from the library to listen offline."
+                )
             } else {
                 downloadsList
             }
         }
         .navigationTitle("Downloads")
         .background(.black)
-        .confirmationDialog(
-            "Remove Download",
-            isPresented: Binding(
-                get: { itemPendingRemoval != nil },
-                set: { if !$0 { itemPendingRemoval = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("Remove", role: .destructive) {
-                if let item = itemPendingRemoval {
-                    BetaDownloadManager.shared.removeCompleted(jellyfinId: item.jellyfinId)
-                }
-                itemPendingRemoval = nil
-            }
-            Button("Cancel", role: .cancel) {
-                itemPendingRemoval = nil
-            }
-        } message: {
-            Text("This will delete the downloaded file.")
-        }
+        .downloadStartFailureAlert(message: $startFailureMessage)
         .confirmationDialog(
             "Clear Download Queue",
             isPresented: $showPurgeConfirmation,
@@ -86,23 +101,6 @@ struct BetaDownloadsView: View {
         } message: {
             Text("This removes all queued downloads. The current download and completed files are not affected.")
         }
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "arrow.down.circle")
-                .font(.title2)
-                .foregroundStyle(.white.opacity(0.2))
-            Text("No downloads yet")
-                .font(.footnote)
-                .foregroundStyle(.white.opacity(0.4))
-            Text("Download songs from the library to listen offline.")
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.25))
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 16)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var downloadsList: some View {
@@ -145,12 +143,7 @@ struct BetaDownloadsView: View {
                 Section {
                     ForEach(failedItems, id: \.id) { item in
                         failedRow(item)
-                    }
-                    .onDelete { offsets in
-                        for index in offsets {
-                            let item = failedItems[index]
-                            BetaDownloadManager.shared.removeCompleted(jellyfinId: item.jellyfinId)
-                        }
+                            .removeDownloadOnLongPress(item, pending: $itemPendingRemoval)
                     }
                 } header: {
                     Text("Failed")
@@ -173,6 +166,7 @@ struct BetaDownloadsView: View {
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(.black)
+        .removeDownloadConfirmation(item: $itemPendingRemoval)
         .toolbar {
             if hasActiveWork {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -197,7 +191,7 @@ struct BetaDownloadsView: View {
                     Text(tab.rawValue)
                         .font(.system(size: 10, weight: selectedTab == tab ? .semibold : .regular))
                         .foregroundStyle(selectedTab == tab ? .white : .white.opacity(0.35))
-                        .frame(maxWidth: .infinity, minHeight: 28)
+                        .frame(maxWidth: .infinity, minHeight: downloadsRowMinHeight)
                         .background(
                             selectedTab == tab ? Color.white.opacity(0.12) : Color.clear,
                             in: Capsule()
@@ -223,153 +217,72 @@ struct BetaDownloadsView: View {
     }
 
     private var songsContent: some View {
-        Group {
-            if completedItems.count > 1 {
-                shuffleButton
+        // Bound once so the sort isn't re-run for every row, and so the
+        // rendered list and the queue handed to playback are the same array.
+        let songs = completedSongs
+        return Group {
+            DownloadedShuffleAllRow(count: songs.count) {
+                startPlayback(items: songs, startingAt: nil, shuffle: true)
             }
+            .listRowBackground(Color.clear)
 
-            ForEach(completedItems, id: \.id) { item in
-                completedRow(item)
-            }
-            .onDelete { offsets in
-                for index in offsets {
-                    let item = completedItems[index]
-                    BetaDownloadManager.shared.removeCompleted(jellyfinId: item.jellyfinId)
+            ForEach(songs, id: \.id) { item in
+                Button {
+                    startPlayback(items: songs, startingAt: item.jellyfinId, shuffle: false)
+                } label: {
+                    DownloadedTrackRow(
+                        item: item,
+                        artworkURL: DownloadedArtwork.url(albumId: item.albumId, serverURL: serverURL),
+                        subtitle: item.artistName
+                    )
                 }
+                .buttonStyle(.plain)
+                .removeDownloadOnLongPress(item, pending: $itemPendingRemoval)
             }
         }
     }
 
     private var albumsContent: some View {
-        let grouped = Dictionary(grouping: completedItems) { $0.albumId }
-        let sortedAlbums = grouped.sorted { lhs, rhs in
-            let lhsName = lhs.value.first?.albumName ?? ""
-            let rhsName = rhs.value.first?.albumName ?? ""
-            return lhsName.localizedCaseInsensitiveCompare(rhsName) == .orderedAscending
-        }
-
-        return ForEach(sortedAlbums, id: \.key) { albumId, tracks in
-            albumGroupRow(albumId: albumId, tracks: tracks)
+        ForEach(albums) { album in
+            NavigationLink(
+                value: DownloadsRoute.album(id: album.id, name: album.name, artist: album.artistName)
+            ) {
+                DownloadedGroupRow(
+                    title: album.name,
+                    subtitle: "\(album.artistName) \u{2022} \(album.songCountLabel)",
+                    artworkURL: DownloadedArtwork.url(albumId: album.id, serverURL: serverURL),
+                    icon: "opticaldisc"
+                )
+            }
+            .buttonStyle(.plain)
         }
     }
 
     private var artistsContent: some View {
-        let grouped = Dictionary(grouping: completedItems) { $0.artistName }
-        let sortedArtists = grouped.keys.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-
-        return ForEach(sortedArtists, id: \.self) { artistName in
-            let tracks = grouped[artistName] ?? []
-            artistGroupRow(artistName: artistName, tracks: tracks)
-        }
-    }
-
-    // MARK: - Album Group Row
-
-    private func albumGroupRow(albumId: String, tracks: [BetaDownloadItem]) -> some View {
-        let albumName = tracks.first?.albumName ?? "Unknown Album"
-        let artistName = tracks.first?.artistName ?? ""
-
-        return Button {
-            playAlbumTracks(tracks)
-        } label: {
-            HStack(spacing: 8) {
-                JellyfinImage(
-                    url: albumArtURL(albumId: albumId),
-                    icon: "opticaldisc"
-                )
-                .frame(width: 28, height: 28)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(albumName)
-                        .font(.footnote)
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                    Text("\(artistName) \u{2022} \(tracks.count) song\(tracks.count == 1 ? "" : "s")")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(0.35))
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                Image(systemName: "play.circle.fill")
-                    .font(.callout)
-                    .foregroundStyle(.green)
-            }
-        }
-        .buttonStyle(.plain)
-    }
-
-    // MARK: - Artist Group Row
-
-    private func artistGroupRow(artistName: String, tracks: [BetaDownloadItem]) -> some View {
-        let representativeAlbumId = tracks.first(where: { !$0.albumId.isEmpty })?.albumId
-
-        return Button {
-            playArtistTracks(tracks)
-        } label: {
-            HStack(spacing: 8) {
-                JellyfinImage(
-                    url: representativeAlbumId.flatMap { albumArtURL(albumId: $0) },
+        ForEach(artists, id: \.name) { artist in
+            NavigationLink(value: DownloadsRoute.artist(name: artist.name)) {
+                DownloadedGroupRow(
+                    title: artist.name.isEmpty ? "Unknown Artist" : artist.name,
+                    subtitle: "\(artist.songCount) song\(artist.songCount == 1 ? "" : "s") \u{2022} \(artist.albumCount) album\(artist.albumCount == 1 ? "" : "s")",
+                    artworkURL: artist.artworkAlbumId.flatMap {
+                        DownloadedArtwork.url(albumId: $0, serverURL: serverURL)
+                    },
                     icon: "music.mic",
-                    cornerRadius: 14
+                    isCircular: true
                 )
-                .frame(width: 28, height: 28)
-                .clipShape(Circle())
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(artistName)
-                        .font(.footnote)
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                    let albumCount = Set(tracks.compactMap { $0.albumId.isEmpty ? nil : $0.albumId }).count
-                    Text("\(tracks.count) song\(tracks.count == 1 ? "" : "s") \u{2022} \(albumCount) album\(albumCount == 1 ? "" : "s")")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(0.35))
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                Image(systemName: "play.circle.fill")
-                    .font(.callout)
-                    .foregroundStyle(.green)
             }
+            .buttonStyle(.plain)
         }
-        .buttonStyle(.plain)
     }
 
-    // MARK: - Shuffle
-
-    private var shuffleButton: some View {
-        Button {
-            shuffleCompleted()
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "shuffle")
-                    .font(.footnote)
-                    .foregroundStyle(.blue)
-                Text("Shuffle Downloads")
-                    .font(.footnote)
-                    .foregroundStyle(.blue)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func shuffleCompleted() {
-        guard !completedItems.isEmpty else { return }
-        startPlayback(items: completedItems, shuffle: true)
-    }
-
-    // MARK: - Row views
+    // MARK: - In-progress rows
 
     private func activeRow(_ item: BetaDownloadItem) -> some View {
-        HStack(spacing: 8) {
-            JellyfinImage(
-                url: albumArtURL(for: item),
-                icon: "music.note"
-            )
-            .frame(width: 28, height: 28)
+        let progress = BetaDownloadManager.shared.progressByTrackId[item.jellyfinId]
+
+        return HStack(spacing: 8) {
+            JellyfinImage(url: albumArtURL(for: item), icon: "music.note")
+                .frame(width: 28, height: 28)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.trackName)
@@ -380,74 +293,34 @@ struct BetaDownloadsView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.white.opacity(0.35))
                     .lineLimit(1)
-                if item.totalBytes > 0 {
-                    Text(formatBytes(item.downloadedBytes) + " / " + formatBytes(item.totalBytes))
-                        .font(.system(size: 9))
-                        .foregroundStyle(.white.opacity(0.2))
-                        .monospacedDigit()
-                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if item.totalBytes > 0 {
-                CircularProgressView(progress: item.progress)
+            // The ring is the progress indicator. Its denominator is estimated
+            // from the track's duration, since a transcoded response carries no
+            // Content-Length — see `DownloadProgress.estimatedBytes`.
+            if let fraction = progress?.fraction(
+                expectedBytes: DownloadProgress.estimatedBytes(forDurationSeconds: item.durationSeconds)
+            ) {
+                CircularProgressView(progress: fraction)
                     .frame(width: 22, height: 22)
             } else {
+                // Jellyfin transcodes before sending the first byte, so a
+                // just-started download legitimately has nothing to show yet.
                 Image(systemName: "arrow.down.circle.fill")
                     .font(.callout)
                     .foregroundStyle(.blue)
             }
 
-            Button {
-                BetaDownloadManager.shared.cancel(jellyfinId: item.jellyfinId)
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.callout)
-                    .foregroundStyle(.white.opacity(0.3))
-                    .frame(width: 30, height: 30)
-            }
-            .buttonStyle(.plain)
+            cancelButton(for: item)
         }
-    }
-
-    private func formatBytes(_ bytes: Int64) -> String {
-        let mb = Double(bytes) / (1024 * 1024)
-        if mb >= 1 {
-            return String(format: "%.1f MB", mb)
-        }
-        let kb = Double(bytes) / 1024
-        return String(format: "%.0f KB", kb)
-    }
-
-    private func albumArtURL(for item: BetaDownloadItem) -> URL? {
-        let itemId = item.albumId.isEmpty ? item.jellyfinId : item.albumId
-        return albumArtURL(albumId: itemId)
-    }
-
-    private func albumArtURL(albumId: String) -> URL? {
-        guard !albumId.isEmpty else { return nil }
-
-        let cachedFile = BetaDownloadManager.artworkFileURL(forAlbumId: albumId)
-        if FileManager.default.fileExists(atPath: cachedFile.path) {
-            return cachedFile
-        }
-
-        guard !serverURL.isEmpty else { return nil }
-        return apiClient.imageURL(
-            serverURL: serverURL,
-            itemId: albumId,
-            maxWidth: 60,
-            maxHeight: 60
-        )
+        .frame(minHeight: downloadsRowMinHeight)
     }
 
     private func queuedRow(_ item: BetaDownloadItem) -> some View {
         HStack(spacing: 8) {
-            JellyfinImage(
-                url: albumArtURL(for: item),
-                icon: "music.note"
-            )
-            .frame(width: 28, height: 28)
+            JellyfinImage(url: albumArtURL(for: item), icon: "music.note")
+                .frame(width: 28, height: 28)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.trackName)
@@ -465,47 +338,9 @@ struct BetaDownloadsView: View {
                 .font(.callout)
                 .foregroundStyle(.blue.opacity(0.4))
 
-            Button {
-                BetaDownloadManager.shared.cancel(jellyfinId: item.jellyfinId)
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.callout)
-                    .foregroundStyle(.white.opacity(0.3))
-                    .frame(width: 30, height: 30)
-            }
-            .buttonStyle(.plain)
+            cancelButton(for: item)
         }
-    }
-
-    private func completedRow(_ item: BetaDownloadItem) -> some View {
-        Button {
-            playCompletedItem(item)
-        } label: {
-            HStack(spacing: 8) {
-                JellyfinImage(
-                    url: albumArtURL(for: item),
-                    icon: "music.note"
-                )
-                .frame(width: 28, height: 28)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.trackName)
-                        .font(.footnote)
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                    Text(item.artistName)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(0.35))
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                Image(systemName: "play.circle.fill")
-                    .font(.callout)
-                    .foregroundStyle(.green)
-            }
-        }
-        .buttonStyle(.plain)
+        .frame(minHeight: downloadsRowMinHeight)
     }
 
     private func failedRow(_ item: BetaDownloadItem) -> some View {
@@ -530,88 +365,67 @@ struct BetaDownloadsView: View {
                 Image(systemName: "arrow.clockwise.circle.fill")
                     .font(.callout)
                     .foregroundStyle(.orange)
-                    .frame(width: 30, height: 30)
+                    .frame(width: 32, height: downloadsRowMinHeight)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Retry \(item.trackName)")
         }
+        .frame(minHeight: downloadsRowMinHeight)
+    }
+
+    /// 32 pt wide, not the 44 pt soul.md §3.4 asks for: on a 32 mm screen a
+    /// 44 pt cancel button alongside artwork and a progress ring squeezes the
+    /// track title to unreadable. Height is the full 44 pt row and the hit
+    /// area is widened with `contentShape`, so this is taller and easier to
+    /// hit than the 30x30 it replaces — but it is a deliberate partial fix,
+    /// not compliance.
+    private func cancelButton(for item: BetaDownloadItem) -> some View {
+        Button {
+            BetaDownloadManager.shared.cancel(jellyfinId: item.jellyfinId)
+        } label: {
+            Image(systemName: "xmark.circle.fill")
+                .font(.callout)
+                .foregroundStyle(.white.opacity(0.3))
+                .frame(width: 32, height: downloadsRowMinHeight)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Cancel \(item.trackName)")
+    }
+
+    // MARK: - Helpers
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        let mb = Double(bytes) / (1024 * 1024)
+        if mb >= 1 {
+            return String(format: "%.1f MB", mb)
+        }
+        let kb = Double(bytes) / 1024
+        return String(format: "%.0f KB", kb)
+    }
+
+    private func albumArtURL(for item: BetaDownloadItem) -> URL? {
+        let itemId = item.albumId.isEmpty ? item.jellyfinId : item.albumId
+        return DownloadedArtwork.url(albumId: itemId, serverURL: serverURL)
     }
 
     // MARK: - Playback
 
-    private func playCompletedItem(_ item: BetaDownloadItem) {
-        guard let fileName = item.localFileName else { return }
-        let fileURL = BetaDownloadManager.downloadsDirectory.appendingPathComponent(fileName)
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
-
-        startPlayback(items: completedItems, startingAt: item.jellyfinId)
-    }
-
-    private func playAlbumTracks(_ tracks: [BetaDownloadItem]) {
-        guard let first = tracks.first else { return }
-        startPlayback(items: tracks, startingAt: first.jellyfinId)
-    }
-
-    private func playArtistTracks(_ tracks: [BetaDownloadItem]) {
-        guard let first = tracks.first else { return }
-        startPlayback(items: tracks, startingAt: first.jellyfinId)
-    }
-
-    private func startPlayback(items: [BetaDownloadItem], startingAt trackId: String? = nil, shuffle: Bool = false) {
-        let queueItems = items.compactMap { dl -> QueueItem? in
-            guard dl.localFileName != nil else { return nil }
-            return QueueItem(
-                trackId: dl.jellyfinId,
-                title: dl.trackName,
-                artistName: dl.artistName,
-                albumName: dl.albumName,
-                albumId: dl.albumId,
-                durationSeconds: dl.durationSeconds,
-                serverURL: "",
-                accessToken: ""
-            )
+    private func startPlayback(items: [BetaDownloadItem], startingAt trackId: String?, shuffle: Bool) {
+        let result = DownloadedPlayback.start(
+            items: items,
+            startingAt: trackId,
+            shuffle: shuffle,
+            engine: playbackEngine,
+            nowPlayingManager: nowPlayingManager
+        )
+        switch result {
+        case .success:
+            showNowPlaying()
+        case .failure(let failure):
+            startFailureMessage = failure.message
         }
-        guard !queueItems.isEmpty else { return }
-
-        let startId: String
-        if shuffle {
-            if !playbackEngine.isShuffleEnabled { playbackEngine.toggleShuffle() }
-            startId = queueItems.randomElement()!.trackId
-        } else {
-            if playbackEngine.isShuffleEnabled { playbackEngine.toggleShuffle() }
-            startId = trackId ?? queueItems[0].trackId
-        }
-
-        playbackEngine.setQueue(queueItems, startingAt: startId)
-        playbackEngine.onQueueItemChanged = { [nowPlayingManager] queueItem in
-            nowPlayingManager.setNowPlaying(track: NowPlayingTrack(
-                trackId: queueItem.trackId,
-                title: queueItem.title,
-                artistName: queueItem.artistName,
-                albumName: queueItem.albumName,
-                albumId: queueItem.albumId,
-                durationSeconds: queueItem.durationSeconds
-            ))
-        }
-
-        if let dlItem = items.first(where: { $0.jellyfinId == startId }),
-           let fileName = dlItem.localFileName {
-            let fileURL = BetaDownloadManager.downloadsDirectory.appendingPathComponent(fileName)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                playbackEngine.playLocalFile(url: fileURL, trackId: startId)
-            }
-        }
-
-        if let startItem = queueItems.first(where: { $0.trackId == startId }) {
-            nowPlayingManager.setNowPlaying(track: NowPlayingTrack(
-                trackId: startItem.trackId,
-                title: startItem.title,
-                artistName: startItem.artistName,
-                albumName: startItem.albumName,
-                albumId: startItem.albumId,
-                durationSeconds: startItem.durationSeconds
-            ))
-        }
-        showNowPlaying()
     }
 }
 

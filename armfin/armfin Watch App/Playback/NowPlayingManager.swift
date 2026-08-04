@@ -11,9 +11,22 @@ struct NowPlayingMetadata: Sendable {
     let albumId: String?
 }
 
+/// Carries elapsed time only — deliberately not playback state.
+///
+/// It used to carry `state` too, as a copy of `PlaybackEngine.currentState`
+/// taken whenever this snapshot was republished. That copy was the source of
+/// the "sometimes it plays, sometimes it doesn't" reports: it is written from
+/// the 1 Hz periodic time observer, which **only fires while the player is
+/// actually advancing time**, and from `setNowPlaying(track:)`. Starting a
+/// track calls `setNowPlaying` *before* the load begins, so the snapshot got
+/// stamped with the pre-load state and then nothing refreshed it until audio
+/// was already running. A view reading it saw a pause button over silence, or
+/// a spinner with nothing left to clear it.
+///
+/// Elapsed time is legitimately a sampled 1 Hz value. Playback state is not —
+/// read it live from `PlaybackEngine`, which is `@Observable`.
 struct NowPlayingSnapshot: Sendable, Equatable {
     let elapsedTime: TimeInterval
-    let state: PlaybackState
 }
 
 @Observable
@@ -27,7 +40,7 @@ final class NowPlayingManager {
 
     // MARK: - Observable snapshot
 
-    private(set) var nowPlayingSnapshot = NowPlayingSnapshot(elapsedTime: 0, state: .idle)
+    private(set) var nowPlayingSnapshot = NowPlayingSnapshot(elapsedTime: 0)
 
     private(set) var currentTrack: NowPlayingTrack?
 
@@ -96,7 +109,7 @@ final class NowPlayingManager {
         currentMetadata = nil
         currentTrack = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
-        nowPlayingSnapshot = NowPlayingSnapshot(elapsedTime: 0, state: .idle)
+        nowPlayingSnapshot = NowPlayingSnapshot(elapsedTime: 0)
     }
 
     func setNowPlaying(track: NowPlayingTrack) {
@@ -112,7 +125,7 @@ final class NowPlayingManager {
 
     private func publishNowPlayingInfo(elapsedTime: TimeInterval) {
         let engineState = playbackEngine.currentState
-        nowPlayingSnapshot = NowPlayingSnapshot(elapsedTime: elapsedTime, state: engineState)
+        nowPlayingSnapshot = NowPlayingSnapshot(elapsedTime: elapsedTime)
 
         guard let currentMetadata else { return }
 

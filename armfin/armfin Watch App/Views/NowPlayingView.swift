@@ -7,11 +7,8 @@ struct NowPlayingView: View {
 
     @Environment(\.playbackEngine) private var playbackEngine
     @Environment(\.nowPlayingManager) private var nowPlayingManager
-    @Environment(\.modelContext) private var modelContext
 
     @State private var showRemoveConfirmation = false
-
-    @Query private var allBetaItems: [BetaDownloadItem]
 
     private var track: NowPlayingTrack {
         nowPlayingManager.currentTrack ?? initialTrack
@@ -19,14 +16,6 @@ struct NowPlayingView: View {
 
     init(track: NowPlayingTrack) {
         self.initialTrack = track
-    }
-
-    private var betaItem: BetaDownloadItem? {
-        allBetaItems.first { $0.jellyfinId == track.trackId }
-    }
-
-    private var betaDownloadStatus: BetaDownloadStatus? {
-        betaItem?.status
     }
 
     /// Local-cache-first artwork resolution, mirroring
@@ -49,8 +38,11 @@ struct NowPlayingView: View {
         return track.artworkURL
     }
 
+    /// Read live from the engine, which is `@Observable`, so the transport
+    /// controls always reflect what the player is actually doing. Reading a
+    /// republished copy off `NowPlayingManager` is what made this screen lie.
     private var playbackState: PlaybackState {
-        nowPlayingManager.nowPlayingSnapshot.state
+        playbackEngine.currentState
     }
 
     private var isPlaying: Bool {
@@ -58,12 +50,7 @@ struct NowPlayingView: View {
     }
 
     private var isBuffering: Bool {
-        switch playbackState {
-        case .buffering, .loadingItem:
-            return true
-        default:
-            return false
-        }
+        playbackState == .loading
     }
 
     var body: some View {
@@ -98,9 +85,6 @@ struct NowPlayingView: View {
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 downloadToggleButton
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                shuffleToggleButton
             }
         }
         .confirmationDialog(
@@ -207,9 +191,20 @@ struct NowPlayingView: View {
 
     // MARK: - Download toggle (toolbar)
 
+    /// `.id(track.trackId)` is required, not cosmetic: `DownloadItemReader`
+    /// captures its predicate at init, so without a fresh view identity the
+    /// button would keep showing the previous track's download state as the
+    /// queue advances.
     private var downloadToggleButton: some View {
+        DownloadItemReader(jellyfinId: track.trackId) { item in
+            downloadToggleButton(status: item?.status)
+        }
+        .id(track.trackId)
+    }
+
+    private func downloadToggleButton(status betaDownloadStatus: BetaDownloadStatus?) -> some View {
         Button {
-            toggleBetaDownload()
+            toggleBetaDownload(status: betaDownloadStatus)
         } label: {
             Group {
                 switch betaDownloadStatus {
@@ -233,11 +228,11 @@ struct NowPlayingView: View {
             .font(.system(size: 15))
             .frame(width: 44, height: 44)
         }
-        .accessibilityLabel(betaDownloadAccessibilityLabel)
+        .accessibilityLabel(betaDownloadAccessibilityLabel(for: betaDownloadStatus))
     }
 
-    private var betaDownloadAccessibilityLabel: String {
-        switch betaDownloadStatus {
+    private func betaDownloadAccessibilityLabel(for status: BetaDownloadStatus?) -> String {
+        switch status {
         case nil: return "Download Track"
         case .queued: return "Download Queued"
         case .downloading: return "Downloading"
@@ -246,80 +241,8 @@ struct NowPlayingView: View {
         }
     }
 
-    // MARK: - Shuffle downloads (toolbar)
 
-    private var completedDownloads: [BetaDownloadItem] {
-        allBetaItems.filter { $0.status == .completed }
-    }
-
-    private var shuffleToggleButton: some View {
-        Button {
-            shuffleDownloadedSongs()
-        } label: {
-            Image(systemName: "shuffle")
-                .font(.system(size: 15))
-                .foregroundStyle(.white.opacity(0.5))
-                .frame(width: 44, height: 44)
-        }
-        .accessibilityLabel("Shuffle Downloads")
-        .disabled(completedDownloads.isEmpty)
-    }
-
-    private func shuffleDownloadedSongs() {
-        let items = completedDownloads
-        guard !items.isEmpty else { return }
-
-        let queueItems = items.compactMap { dl -> QueueItem? in
-            guard dl.localFileName != nil else { return nil }
-            return QueueItem(
-                trackId: dl.jellyfinId,
-                title: dl.trackName,
-                artistName: dl.artistName,
-                albumName: dl.albumName,
-                albumId: dl.albumId,
-                durationSeconds: dl.durationSeconds,
-                serverURL: "",
-                accessToken: ""
-            )
-        }
-        guard !queueItems.isEmpty else { return }
-
-        if !playbackEngine.isShuffleEnabled { playbackEngine.toggleShuffle() }
-        let startId = queueItems.randomElement()!.trackId
-
-        playbackEngine.setQueue(queueItems, startingAt: startId)
-        playbackEngine.onQueueItemChanged = { [nowPlayingManager] queueItem in
-            nowPlayingManager.setNowPlaying(track: NowPlayingTrack(
-                trackId: queueItem.trackId,
-                title: queueItem.title,
-                artistName: queueItem.artistName,
-                albumName: queueItem.albumName,
-                albumId: queueItem.albumId,
-                durationSeconds: queueItem.durationSeconds
-            ))
-        }
-
-        if let dlItem = items.first(where: { $0.jellyfinId == startId }),
-           let fileName = dlItem.localFileName {
-            let fileURL = BetaDownloadManager.downloadsDirectory.appendingPathComponent(fileName)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                playbackEngine.playLocalFile(url: fileURL, trackId: startId)
-            }
-        }
-
-        if let startItem = queueItems.first(where: { $0.trackId == startId }) {
-            nowPlayingManager.setNowPlaying(track: NowPlayingTrack(
-                trackId: startItem.trackId,
-                title: startItem.title,
-                artistName: startItem.artistName,
-                albumName: startItem.albumName,
-                albumId: startItem.albumId,
-                durationSeconds: startItem.durationSeconds
-            ))
-        }
-    }
-
-    private func toggleBetaDownload() {
+    private func toggleBetaDownload(status betaDownloadStatus: BetaDownloadStatus?) {
         switch betaDownloadStatus {
         case .queued, .downloading:
             BetaDownloadManager.shared.cancel(jellyfinId: track.trackId)
@@ -340,7 +263,9 @@ struct NowPlayingView: View {
             artistName: track.artistName,
             albumName: track.albumName,
             albumId: track.albumId ?? "",
-            durationTicks: Int64(track.durationSeconds * 10_000_000)
+            durationTicks: Int64(track.durationSeconds * 10_000_000),
+            indexNumber: track.indexNumber,
+            discNumber: track.discNumber
         ))
     }
 

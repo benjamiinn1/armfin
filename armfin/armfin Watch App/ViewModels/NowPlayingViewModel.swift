@@ -10,8 +10,14 @@ struct NowPlayingTrack: Hashable, Sendable {
     let durationSeconds: Double
     let artworkURL: URL?
 
+    /// Carried purely so the Now Playing screen's download button can persist
+    /// them — it has no other handle on the track's position in its album.
+    let indexNumber: Int?
+    let discNumber: Int?
+
     init(trackId: String, title: String, artistName: String, albumName: String,
-         albumId: String? = nil, durationSeconds: Double, artworkURL: URL? = nil) {
+         albumId: String? = nil, durationSeconds: Double, artworkURL: URL? = nil,
+         indexNumber: Int? = nil, discNumber: Int? = nil) {
         self.trackId = trackId
         self.title = title
         self.artistName = artistName
@@ -19,5 +25,7 @@ struct NowPlayingTrack: Hashable, Sendable {
         self.albumId = albumId
         self.durationSeconds = durationSeconds
         self.artworkURL = artworkURL
+        self.indexNumber = indexNumber
+        self.discNumber = discNumber
     }
 }
