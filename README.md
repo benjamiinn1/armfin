@@ -8,11 +8,12 @@ A free, open-source, standalone **watchOS** app that streams and downloads music
 
 armfin connects directly to your Jellyfin server over Wi-Fi or cellular and gives you full access to your music library on your wrist:
 
+- **Sign in** with username and password, or Quick Connect — approve a short code on any device where you're already signed in to Jellyfin
 - **Browse** your library — Artists, Albums, Tracks
-- **Stream** audio directly from your server
+- **Stream** audio directly from your server (AAC, 128 kbps)
 - **Download** tracks or full albums to the watch for offline playback during workouts
 - **Now Playing** integration with system controls (play/pause/skip from the watch face)
-- **Offline fallback** — downloaded tracks play automatically when your server is unreachable
+- **Offline playback** — local-first: a downloaded track always plays from the watch, and the server is only used for tracks you haven't downloaded (your downloads keep playing when the server is unreachable)
 
 No companion iOS app. No cloud intermediary. No accounts, trackers, or ads.
 
@@ -55,24 +56,30 @@ The project keeps developer-specific settings (Team ID, bundle identifiers) out 
 
 ## Architecture
 
-Single watchOS target. Pure SwiftUI + SwiftData + AVFoundation.
+Single watchOS target. SwiftUI + SwiftData + AVFoundation, with WatchKit where SwiftUI can't reach: the `WKApplicationDelegate` that reattaches the background download session on relaunch, and the Digital Crown volume control on the Now Playing screen. All source lives under `armfin/armfin Watch App/` (the `armfin` target is a thin App Store packaging container with no source of its own).
 
 ```
 armfin Watch App/
-├── App/                  # App delegate, background URLSession handling
-├── BetaDownload/         # Download manager, UI buttons, downloads list view
-├── Models/               # SwiftData models (server config, artists, albums, tracks, downloads)
-├── Playback/             # AVPlayer wrapper, Now Playing/remote command integration
-├── Services/             # Jellyfin API client, Keychain store
-├── ViewModels/           # Observable view models (login, browse, album, track, now playing)
-└── Views/                # SwiftUI views (login, home, artist/album/track lists, now playing, settings)
+├── ArmfinApp.swift          # @main, schema-version gate, ModelContainer
+├── App/ArmfinAppDelegate.swift   # WKApplicationDelegate: background session reattach
+├── Models/                  # SwiftData models (server config, artist/album/track cache)
+├── Services/                # JellyfinAPIClient, KeychainStore, NetworkStatusService
+├── Playback/                # PlaybackEngine (queue + local-vs-stream), NowPlayingManager
+├── BetaDownload/            # the offline-download system: BetaDownloadItem model,
+│                            #   BetaDownloadManager (background URLSession), download
+│                            #   views + navigation, DownloadedPlayback entry point
+├── ViewModels/              # Observable view models (login, browse, album/track lists,
+│                            #   library-wide lists, now playing)
+└── Views/                   # RootView (permanent 4-tab shell), SignInView, OfflineGate,
+                             #   SettingsView, artist/album/track lists, Now Playing, etc.
 ```
 
 Key design decisions:
 
-- **Schema-versioned SwiftData** — the app tracks a schema version marker and nukes the local database on incompatible upgrades rather than attempting risky migrations on-device.
-- **Background downloads** — uses a dedicated background `URLSessionDownloadTask` pipeline (`BetaDownloadManager`) that survives app suspension and resumes on relaunch.
-- **Playback engine** — wraps `AVPlayer` with queue management, offline/streaming fallback, and wires into `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` for system integration.
+- **Schema-versioned SwiftData** — the app tracks a schema version marker and wipes the local store (data, downloads, and credentials) on incompatible upgrades rather than attempting risky migrations on-device.
+- **Background downloads** — a dedicated background `URLSessionDownloadTask` pipeline (`BetaDownloadManager`) that survives app suspension and resumes on relaunch. Downloads are a 128 kbps AAC transcode so every file lands the same small size regardless of source format.
+- **Playback engine** — wraps `AVPlayer` with queue management, local-vs-streaming fallback (a completed download wins), and wires into `MPNowPlayingInfoCenter` + `MPRemoteCommandCenter` for system integration.
+- **Offline detection** — reactive from the outcome of real API calls (`NetworkStatusService`), never from an interface-level signal.
 
 ## Privacy
 
