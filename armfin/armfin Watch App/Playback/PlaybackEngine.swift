@@ -33,11 +33,16 @@ struct QueueItem: Equatable, Sendable {
     let artworkURL: URL?
     let indexNumber: Int?
     let discNumber: Int?
+    /// First genre tag, if any — carried through the queue so a download
+    /// started from the Now Playing screen (`NowPlayingView`) captures the
+    /// same genre offline that streaming had online, regardless of which
+    /// browse screen started this queue.
+    let genreName: String?
 
     init(trackId: String, title: String, artistName: String, albumName: String,
          albumId: String? = nil, durationSeconds: Double, serverURL: String,
          accessToken: String, artworkURL: URL? = nil,
-         indexNumber: Int? = nil, discNumber: Int? = nil) {
+         indexNumber: Int? = nil, discNumber: Int? = nil, genreName: String? = nil) {
         self.trackId = trackId
         self.title = title
         self.artistName = artistName
@@ -49,6 +54,7 @@ struct QueueItem: Equatable, Sendable {
         self.artworkURL = artworkURL
         self.indexNumber = indexNumber
         self.discNumber = discNumber
+        self.genreName = genreName
     }
 }
 

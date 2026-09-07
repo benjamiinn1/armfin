@@ -97,7 +97,8 @@ enum DownloadedPlayback {
             serverURL: "",
             accessToken: "",
             indexNumber: item.indexNumber,
-            discNumber: item.discNumber
+            discNumber: item.discNumber,
+            genreName: item.genreName
         )
     }
 
@@ -110,7 +111,8 @@ enum DownloadedPlayback {
             albumId: item.albumId,
             durationSeconds: item.durationSeconds,
             indexNumber: item.indexNumber,
-            discNumber: item.discNumber
+            discNumber: item.discNumber,
+            genreName: item.genreName
         )
     }
 }

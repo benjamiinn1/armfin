@@ -145,7 +145,8 @@ struct TrackListView: View {
                 accessToken: viewModel.accessToken,
                 artworkURL: trackArtworkURL(t),
                 indexNumber: t.indexNumber,
-                discNumber: t.discNumber
+                discNumber: t.discNumber,
+                genreName: t.genreName
             )
         }
         playbackEngine.setQueue(queueItems, startingAt: nowPlaying.trackId)
@@ -159,7 +160,8 @@ struct TrackListView: View {
                 durationSeconds: item.durationSeconds,
                 artworkURL: item.artworkURL,
                 indexNumber: item.indexNumber,
-                discNumber: item.discNumber
+                discNumber: item.discNumber,
+                genreName: item.genreName
             ))
         }
         playbackEngine.play(
@@ -186,7 +188,8 @@ struct TrackListView: View {
                 albumId: track.albumId ?? "",
                 durationTicks: track.durationTicks,
                 indexNumber: track.indexNumber,
-                discNumber: track.discNumber
+                discNumber: track.discNumber,
+                genreName: track.genreName ?? ""
             ))
         }
     }
@@ -226,7 +229,8 @@ struct TrackListView: View {
             durationSeconds: Double(track.durationTicks) / 10_000_000,
             artworkURL: trackArtworkURL(track),
             indexNumber: track.indexNumber,
-            discNumber: track.discNumber
+            discNumber: track.discNumber,
+            genreName: track.genreName
         )
     }
 

@@ -1,8 +1,18 @@
 import SwiftUI
 import SwiftData
 
-struct AllTrackListView: View {
-    @State private var viewModel: AllTracksViewModel
+/// The genre detail screen: songs available in a single genre. Reached by
+/// tapping a row in `GenreListView` (a `NavigationLink` push).
+///
+/// Mirrors `AllTrackListView` (the Songs tab) — the closest existing screen,
+/// since a genre's songs are exactly a filtered Songs list — for structure,
+/// the Shuffle All row, the per-track play + beta-download row, the
+/// pagination footer, the playback wiring, and the `OfflineGate`. The only
+/// difference from the Songs tab is the fetch: `GenreTracksViewModel` scopes
+/// every `/Items` call to `GenreIds=<genreId>`, so the queue, Shuffle All, and
+/// the displayed list are all confined to this genre.
+struct GenreTrackListView: View {
+    @State private var viewModel: GenreTracksViewModel
 
     @Environment(\.playbackEngine) private var playbackEngine
     @Environment(\.nowPlayingManager) private var nowPlayingManager
@@ -12,15 +22,17 @@ struct AllTrackListView: View {
     private let userId: String
     private let accessToken: String
 
-    init(serverURL: String, userId: String, accessToken: String) {
+    init(serverURL: String, userId: String, accessToken: String, genreId: String, genreName: String) {
         self.serverURL = serverURL
         self.userId = userId
         self.accessToken = accessToken
         _viewModel = State(
-            wrappedValue: AllTracksViewModel(
+            wrappedValue: GenreTracksViewModel(
                 serverURL: serverURL,
                 userId: userId,
-                accessToken: accessToken
+                accessToken: accessToken,
+                genreId: genreId,
+                genreName: genreName
             )
         )
     }
@@ -39,9 +51,10 @@ struct AllTrackListView: View {
                 errorState(error)
             }
         }
+        .navigationTitle(viewModel.genreName)
         .background(.black)
         .offlineGate(
-            tabKey: "all-tracks",
+            tabKey: "genre:\(viewModel.genreId)",
             isUnreachable: viewModel.state == .failed(.serverUnreachable),
             isLoaded: viewModel.state == .loaded,
             onRetry: { await viewModel.load() }
@@ -128,6 +141,8 @@ struct AllTrackListView: View {
         }
 
         let nowPlaying = nowPlayingTrack(for: track)
+        // The queue is built from `viewModel.tracks` — this genre's tracks
+        // only — so playback and shuffle stay confined to the selected genre.
         let queueItems = viewModel.tracks.map { t in
             QueueItem(
                 trackId: t.id,
@@ -141,7 +156,10 @@ struct AllTrackListView: View {
                 artworkURL: trackArtworkURL(t),
                 indexNumber: t.indexNumber,
                 discNumber: t.discNumber,
-                genreName: t.genreName
+                // Every track in this queue came from this one genre's list,
+                // so the genre is the screen's own context, not per-track
+                // metadata — matches `GenreTracksViewModel`'s scoping.
+                genreName: viewModel.genreName
             )
         }
         playbackEngine.setQueue(queueItems, startingAt: nowPlaying.trackId)
@@ -184,7 +202,7 @@ struct AllTrackListView: View {
                 durationTicks: track.durationTicks,
                 indexNumber: track.indexNumber,
                 discNumber: track.discNumber,
-                genreName: track.genreName ?? ""
+                genreName: viewModel.genreName
             ))
         }
     }
@@ -201,7 +219,7 @@ struct AllTrackListView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func errorState(_ error: AllTracksViewModel.TrackError) -> some View {
+    private func errorState(_ error: GenreTracksViewModel.TrackError) -> some View {
         VStack(spacing: 6) {
             Image(systemName: "exclamationmark.triangle")
                 .font(.title3)
@@ -225,7 +243,7 @@ struct AllTrackListView: View {
             artworkURL: trackArtworkURL(track),
             indexNumber: track.indexNumber,
             discNumber: track.discNumber,
-            genreName: track.genreName
+            genreName: viewModel.genreName
         )
     }
 
@@ -243,7 +261,13 @@ struct AllTrackListView: View {
 
 #Preview {
     NavigationStack {
-        AllTrackListView(serverURL: "https://example.com", userId: "user-id", accessToken: "token")
+        GenreTrackListView(
+            serverURL: "https://example.com",
+            userId: "user-id",
+            accessToken: "token",
+            genreId: "genre-id",
+            genreName: "Rock"
+        )
     }
     .modelContainer(for: [BetaDownloadItem.self], inMemory: true)
 }

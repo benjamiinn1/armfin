@@ -31,6 +31,7 @@ struct RootView: View {
         case artists = "Artists"
         case albums = "Albums"
         case songs = "Songs"
+        case genres = "Genres"
     }
 
     /// Non-nil whenever there's a usable session — restored from the Keychain
@@ -187,6 +188,12 @@ struct RootView: View {
             )
         case .songs:
             AllTrackListView(
+                serverURL: session.serverURL,
+                userId: session.userId,
+                accessToken: session.accessToken
+            )
+        case .genres:
+            GenreListView(
                 serverURL: session.serverURL,
                 userId: session.userId,
                 accessToken: session.accessToken

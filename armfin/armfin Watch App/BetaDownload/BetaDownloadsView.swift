@@ -24,6 +24,7 @@ struct BetaDownloadsView: View {
         case artists = "Artists"
         case albums = "Albums"
         case songs = "Songs"
+        case genres = "Genres"
     }
 
     private var downloadingItems: [BetaDownloadItem] {
@@ -68,6 +69,23 @@ struct BetaDownloadsView: View {
                     name: artistName,
                     songCount: tracks.count,
                     albumCount: Set(tracks.map(\.albumId).filter { !$0.isEmpty }).count,
+                    artworkAlbumId: tracks.first(where: { !$0.albumId.isEmpty })?.albumId
+                )
+            }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    /// Mirrors `artists` above: grouped by the denormalized `genreName` on
+    /// each completed download rather than a server round-trip, since
+    /// Downloads has no network dependency. An empty `genreName` — a track
+    /// downloaded before this feature existed, or from a path that never
+    /// captured genre — is a legitimate group, same as an empty artist name.
+    private var genres: [(name: String, songCount: Int, artworkAlbumId: String?)] {
+        Dictionary(grouping: completedItems, by: \.genreName)
+            .map { genreName, tracks in
+                (
+                    name: genreName,
+                    songCount: tracks.count,
                     artworkAlbumId: tracks.first(where: { !$0.albumId.isEmpty })?.albumId
                 )
             }
@@ -213,6 +231,8 @@ struct BetaDownloadsView: View {
             albumsContent
         case .artists:
             artistsContent
+        case .genres:
+            genresContent
         }
     }
 
@@ -269,6 +289,26 @@ struct BetaDownloadsView: View {
                     },
                     icon: "music.mic",
                     isCircular: true
+                )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    /// No `isCircular` (matches `albumsContent`, not `artistsContent`) — a
+    /// genre isn't a person, so the same square-artwork treatment as an
+    /// album row is the right shape here, consistent with `GenreListView`'s
+    /// online row also skipping the circular clip artists get.
+    private var genresContent: some View {
+        ForEach(genres, id: \.name) { genre in
+            NavigationLink(value: DownloadsRoute.genre(name: genre.name)) {
+                DownloadedGroupRow(
+                    title: genre.name.isEmpty ? "Unknown Genre" : genre.name,
+                    subtitle: "\(genre.songCount) song\(genre.songCount == 1 ? "" : "s")",
+                    artworkURL: genre.artworkAlbumId.flatMap {
+                        DownloadedArtwork.url(albumId: $0, serverURL: serverURL)
+                    },
+                    icon: "music.note.list"
                 )
             }
             .buttonStyle(.plain)

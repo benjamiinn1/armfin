@@ -14,6 +14,13 @@ final class BetaDownloadItem {
     var albumName: String
     var albumId: String
 
+    /// First genre tag, if any, denormalized the same way `artistName` and
+    /// `albumName` are — captured at download time so the offline Genres tab
+    /// (`BetaDownloadsView`) can group completed downloads without a server
+    /// round-trip. Empty means "not captured" and groups as "Unknown Genre",
+    /// the same convention `artistName` already uses for "Unknown Artist".
+    var genreName: String
+
     /// Jellyfin's `IndexNumber` / `ParentIndexNumber` — track position within
     /// its disc, and which disc. Optional because Jellyfin reports them only
     /// when the source tags carry them. Persisted so downloaded albums list
@@ -68,7 +75,8 @@ final class BetaDownloadItem {
         createdDate: Date = .now,
         completedDate: Date? = nil,
         lastError: String? = nil,
-        durationTicks: Int64 = 0
+        durationTicks: Int64 = 0,
+        genreName: String = ""
     ) {
         self.id = id
         self.jellyfinId = jellyfinId
@@ -78,6 +86,7 @@ final class BetaDownloadItem {
         self.albumId = albumId
         self.indexNumber = indexNumber
         self.discNumber = discNumber
+        self.genreName = genreName
         self.statusRaw = status.rawValue
         self.totalBytes = totalBytes
         self.downloadedBytes = downloadedBytes
