@@ -864,6 +864,67 @@ struct JellyfinAPIClient: Sendable {
         )
     }
 
+    /// Fetches a fresh, server-randomized batch of tracks from across the
+    /// whole music library. Backs the "shuffle all" action available from
+    /// every Library browse tab — each call asks the server for a new random
+    /// set rather than caching one, so the button works the same regardless
+    /// of which tab is showing and never requires holding the whole library
+    /// in memory (soul.md §1.1).
+    func fetchRandomTracks(
+        serverURL: String,
+        userId: String,
+        accessToken: String,
+        musicLibraryId: String,
+        limit: Int = 50
+    ) async throws -> PagedResult<TrackSummary> {
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Items")
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "IncludeItemTypes", value: "Audio"),
+            URLQueryItem(name: "Recursive", value: "true"),
+            URLQueryItem(name: "ParentId", value: musicLibraryId),
+            URLQueryItem(name: "SortBy", value: "Random"),
+            URLQueryItem(name: "userId", value: userId),
+            URLQueryItem(name: "Limit", value: String(limit)),
+            // See fetchTracks: Genres isn't in Jellyfin's default field set.
+            URLQueryItem(name: "Fields", value: "Genres")
+        ]
+
+        guard let finalURL = components?.url else {
+            throw JellyfinAPIClientError.invalidURL
+        }
+
+        var request = URLRequest(url: finalURL)
+        request.httpMethod = "GET"
+        applyCommonHeaders(to: &request, accessToken: accessToken)
+
+        let data = try await perform(request)
+        let response = try decode(ItemsResponse<TrackPayload>.self, from: data)
+
+        let items = response.items.map { payload in
+            TrackSummary(
+                id: payload.id,
+                name: payload.name,
+                indexNumber: payload.indexNumber,
+                discNumber: payload.parentIndexNumber,
+                durationTicks: payload.runTimeTicks ?? 0,
+                container: payload.container,
+                bitrate: payload.mediaSources?.first?.bitrate,
+                artistName: payload.albumArtist,
+                albumName: payload.album,
+                albumId: payload.albumId,
+                imageTag: payload.imageTags?.primary,
+                genreName: payload.genres?.first
+            )
+        }
+
+        return PagedResult(
+            items: items,
+            totalRecordCount: response.totalRecordCount,
+            startIndex: response.startIndex
+        )
+    }
+
     // MARK: - Genres
 
     /// Performs `GET {serverURL}/Genres` with `IncludeItemTypes=Audio`,

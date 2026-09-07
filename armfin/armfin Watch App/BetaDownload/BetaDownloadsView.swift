@@ -104,7 +104,6 @@ struct BetaDownloadsView: View {
                 downloadsList
             }
         }
-        .navigationTitle("Downloads")
         .background(.black)
         .downloadStartFailureAlert(message: $startFailureMessage)
         .confirmationDialog(
@@ -173,14 +172,21 @@ struct BetaDownloadsView: View {
 
             if !completedItems.isEmpty {
                 Section {
-                    tabPicker
-                        .listRowBackground(Color.clear)
+                    LibraryBrowseHeaderRows(
+                        selection: $selectedTab,
+                        shuffleAction: completedSongs.isEmpty ? nil : {
+                            startPlayback(items: completedSongs, startingAt: nil, shuffle: true)
+                        },
+                        statusLabel: "Downloads"
+                    )
 
                     completedContent
                 }
                 .listRowBackground(Color.clear)
             }
         }
+        .environment(\.defaultMinListRowHeight, 16)
+        .listSectionSpacing(.compact)
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(.black)
@@ -194,28 +200,6 @@ struct BetaDownloadsView: View {
                     .font(.caption2)
                     .foregroundStyle(.red)
                 }
-            }
-        }
-    }
-
-    // MARK: - Tab Picker
-
-    private var tabPicker: some View {
-        HStack(spacing: 4) {
-            ForEach(DownloadsTab.allCases, id: \.self) { tab in
-                Button {
-                    selectedTab = tab
-                } label: {
-                    Text(tab.rawValue)
-                        .font(.system(size: 10, weight: selectedTab == tab ? .semibold : .regular))
-                        .foregroundStyle(selectedTab == tab ? .white : .white.opacity(0.35))
-                        .frame(maxWidth: .infinity, minHeight: downloadsRowMinHeight)
-                        .background(
-                            selectedTab == tab ? Color.white.opacity(0.12) : Color.clear,
-                            in: Capsule()
-                        )
-                }
-                .buttonStyle(.plain)
             }
         }
     }
@@ -239,13 +223,10 @@ struct BetaDownloadsView: View {
     private var songsContent: some View {
         // Bound once so the sort isn't re-run for every row, and so the
         // rendered list and the queue handed to playback are the same array.
+        // Shuffling all songs is now the circular button beside the category
+        // dropdown (`CategoryPickerBar`), not a row here.
         let songs = completedSongs
         return Group {
-            DownloadedShuffleAllRow(count: songs.count) {
-                startPlayback(items: songs, startingAt: nil, shuffle: true)
-            }
-            .listRowBackground(Color.clear)
-
             ForEach(songs, id: \.id) { item in
                 Button {
                     startPlayback(items: songs, startingAt: item.jellyfinId, shuffle: false)
