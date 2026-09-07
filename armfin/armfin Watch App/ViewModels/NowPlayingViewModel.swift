@@ -15,9 +15,14 @@ struct NowPlayingTrack: Hashable, Sendable {
     let indexNumber: Int?
     let discNumber: Int?
 
+    /// First genre tag, if any. Carried so `NowPlayingView`'s download
+    /// button (`toggleBetaDownload`) can persist genre offline the same way
+    /// `indexNumber`/`discNumber` are persisted for album order.
+    let genreName: String?
+
     init(trackId: String, title: String, artistName: String, albumName: String,
          albumId: String? = nil, durationSeconds: Double, artworkURL: URL? = nil,
-         indexNumber: Int? = nil, discNumber: Int? = nil) {
+         indexNumber: Int? = nil, discNumber: Int? = nil, genreName: String? = nil) {
         self.trackId = trackId
         self.title = title
         self.artistName = artistName
@@ -27,5 +32,6 @@ struct NowPlayingTrack: Hashable, Sendable {
         self.artworkURL = artworkURL
         self.indexNumber = indexNumber
         self.discNumber = discNumber
+        self.genreName = genreName
     }
 }

@@ -143,9 +143,10 @@ armfin/                                   # repository root
         │   ├── BetaDownloadItem.swift    # @Model download row + sort/group helpers
         │   ├── BetaDownloadManager.swift # background URLSession, queue, delegate
         │   ├── DownloadedPlayback.swift  # single entry point for playing downloads
-        │   ├── BetaDownloadsView.swift   # Downloads tab (3 sub-tabs)
+        │   ├── BetaDownloadsView.swift   # Downloads tab (4 sub-tabs)
         │   ├── DownloadedArtistView.swift
         │   ├── DownloadedAlbumView.swift
+        │   ├── DownloadedGenreView.swift
         │   ├── DownloadsRoute.swift      # value-based navigation routes
         │   ├── DownloadItemReader.swift  # fetch a download row by id
         │   ├── BetaDownloadButton.swift  # per-track download/remove + progress ring
@@ -296,6 +297,7 @@ final class BetaDownloadItem {
     var artistName: String
     var albumName: String
     var albumId: String
+    var genreName: String           // first Jellyfin genre tag, if any ("" = uncaptured/unknown)
     var indexNumber: Int?           // Jellyfin IndexNumber — in-album track position
     var discNumber: Int?            // Jellyfin ParentIndexNumber — which disc
 
@@ -322,13 +324,14 @@ final class BetaDownloadItem {
          albumName: String, albumId: String, indexNumber: Int? = nil, discNumber: Int? = nil,
          status: BetaDownloadStatus = .queued, totalBytes: Int64 = 0, downloadedBytes: Int64 = 0,
          localFileName: String? = nil, createdDate: Date = .now, completedDate: Date? = nil,
-         lastError: String? = nil, durationTicks: Int64 = 0) {
+         lastError: String? = nil, durationTicks: Int64 = 0, genreName: String = "") {
         self.id = id
         self.jellyfinId = jellyfinId
         self.trackName = trackName
         self.artistName = artistName
         self.albumName = albumName
         self.albumId = albumId
+        self.genreName = genreName
         self.indexNumber = indexNumber
         self.discNumber = discNumber
         self.statusRaw = status.rawValue
@@ -344,7 +347,7 @@ final class BetaDownloadItem {
 ```
 
 Notes on the download model:
-- `BetaDownloadItem` is **standalone** — it carries denormalized `trackName`/`artistName`/`albumName`/`albumId` so the Downloads tab and offline playback work with no `Cached*` rows populated. It has no relationship to `CachedTrack`.
+- `BetaDownloadItem` is **standalone** — it carries denormalized `trackName`/`artistName`/`albumName`/`albumId`/`genreName` so the Downloads tab and offline playback work with no `Cached*` rows populated. It has no relationship to `CachedTrack`. `genreName` is the first of a track's Jellyfin genre tags (best-effort, not a full multi-genre model), captured at download time from whichever screen the download started on.
 - **Live progress is not stored here.** Byte counts move to `BetaDownloadManager.progressByTrackId` (in memory) because a SwiftData save per download per second invalidated every `@Query` in the app. Only `statusRaw` is durable. See §3.3.
 - Sorting/grouping helpers (`sortedInAlbumOrder`, `sortedByTitle`, `sortedInArtistOrder`, `groupedIntoAlbums`) live as an `Array where Element == BetaDownloadItem` extension and drive the Downloads tab and "Play All" queue order.
 
@@ -371,6 +374,8 @@ Two deliberately separate `URLSession` stacks — they cannot be merged because 
 | Tracks for album | GET | `/Items` | `ParentId=<albumId>`, `IncludeItemTypes=Audio`, `Recursive=true`, `SortBy=ParentIndexNumber,IndexNumber`, `userId`, `StartIndex`, `Limit` |
 | Library-wide albums | GET | `/Items` | `IncludeItemTypes=MusicAlbum`, `Recursive=true`, `ParentId=<musicLibraryId>`, `SortBy=SortName`, `userId`, `StartIndex`, `Limit` (Albums tab) |
 | Library-wide songs | GET | `/Items` | `IncludeItemTypes=Audio`, `Recursive=true`, `ParentId=<musicLibraryId>`, `SortBy=SortName`, `userId`, `StartIndex`, `Limit` (Songs tab) |
+| Genres | GET | `/Genres` | `IncludeItemTypes=Audio`, `ParentId=<musicLibraryId>`, `Recursive=true`, `SortBy=SortName`, `SortOrder=Ascending`, `userId`, `StartIndex`, `Limit` (Genres tab) |
+| Songs for genre | GET | `/Items` | `IncludeItemTypes=Audio`, `GenreIds=<genreId>`, `Recursive=true`, `ParentId=<musicLibraryId>`, `SortBy=SortName`, `userId`, `StartIndex`, `Limit` (genre detail) |
 | Streaming | GET | `/Audio/{Id}/universal` | `audioCodec/container/transcodingContainer=aac`, `maxStreamingBitrate=128000`, `audioBitRate=128000`, `maxAudioChannels=2`, `api_key`; add `static=true` for direct-play |
 | Background download | GET | `/Audio/{Id}/stream.aac` | `audioCodec=aac`, `audioBitRate=128000`, `maxStreamingBitrate=128000`, `maxAudioChannels=2`, `static=false`, `api_key` — a transcode, not a direct copy |
 | Artwork | GET | `/Items/{Id}/Images/Primary` | `maxWidth`, `maxHeight` (capped to rendered size, default 80), `quality=80`, `tag=<imageTag>` (size appropriately for the watch screen — request at 1x/2x display points, never full-resolution server art) |
@@ -669,14 +674,15 @@ TabView(selection: $selectedTab) {
 .alert("Data Reset", isPresented: $didResetCorruptData) { Button("OK") {} }
 ```
 
-Within the **Library** tab, a custom capsule picker (Artists / Albums / Songs) selects one of three browse screens, only one alive at a time:
+Within the **Library** tab, a custom capsule picker (Artists / Albums / Songs / Genres) selects one of four browse screens, only one alive at a time:
 - **Artists** → `ArtistListView` → `AlbumListView` → `TrackListView`
 - **Albums** → `AllAlbumListView` → `TrackListView`
 - **Songs** → `AllTrackListView`
+- **Genres** → `GenreListView` → `GenreTrackListView`
 
 Tapping a track starts playback and switches the `TabView` selection to Now Playing via the `\.showNowPlaying` environment closure. The browse screens are keyed `.id(session)` so a sign-out/sign-in (or switching servers) gives them a fresh identity and never carries the previous account's credentials.
 
-The **Downloads** tab (`BetaDownloadsView`) has its own 3-sub-tab picker (Artists / Albums / Songs) and uses **value-based** navigation (`NavigationLink(value:)` + `.navigationDestination(for: DownloadsRoute.self)`) into `DownloadedArtistView` / `DownloadedAlbumView`. All offline playback routes through `DownloadedPlayback.start(...)`, which builds the queue only from items whose audio file is actually present on disk.
+The **Downloads** tab (`BetaDownloadsView`) has its own 4-sub-tab picker (Artists / Albums / Songs / Genres) and uses **value-based** navigation (`NavigationLink(value:)` + `.navigationDestination(for: DownloadsRoute.self)`) into `DownloadedArtistView` / `DownloadedAlbumView` / `DownloadedGenreView`. All offline playback routes through `DownloadedPlayback.start(...)`, which builds the queue only from items whose audio file is actually present on disk.
 
 **Offline handling** is shared: the `OfflineGate` `ViewModifier` wraps each browse screen. It is driven by the outcome of the screen's real API call (not an interface-level signal) and by `NetworkStatusService`, which keeps a session-scoped, per-tab "has this screen already failed" set (per-view `@State` doesn't survive SwiftUI tearing the view down on tab switch). On failure it shows "You're offline" with "Go to Downloads" and "Retry".
 
@@ -692,10 +698,13 @@ The **Downloads** tab (`BetaDownloadsView`) has its own 3-sub-tab picker (Artist
 | `TrackListView` | Tracks for one album; tap to play (queue from album); per-track download/remove; Shuffle All. | Loading: `ProgressView`. Empty: "No tracks found". |
 | `AllAlbumListView` | Library-wide flat album list; same navigation/download patterns as artist-scoped. | Loading: `ProgressView`. Empty: "No albums found". |
 | `AllTrackListView` | Library-wide song list; play + download per row; Shuffle All. | Loading: `ProgressView`. Empty: "No songs found". |
+| `GenreListView` | Library-wide genre list (paged); navigates to `GenreTrackListView`. Mirrors `ArtistListView`. `OfflineGate`. | Loading: `ProgressView`. Empty: "No genres found". |
+| `GenreTrackListView` | Songs for one genre (`GenreIds` filter); play + download per row; Shuffle All scoped to the genre; navigates in from `GenreListView`. `OfflineGate`. | Loading: `ProgressView`. Empty: "No songs found". |
 | `NowPlayingView` | Artwork (local cache or remote), title/artist, prev/play-pause/next transport (56pt play, 44pt skip), download toggle, shuffle, `VolumeControl`, error display. | Buffering: spinner on artwork. Failed: inline error. |
 | `NothingPlayingView` | Empty Now Playing state; Shuffle CTA (online) / Shuffle Downloads (offline content). | — |
-| `BetaDownloadsView` | Offline browser, 3 sub-tabs (Artists/Albums/Songs) grouped by denormalized metadata; active-download progress; offline playback; Shuffle at each level; value-based drill-down. | Empty: "No downloads yet". |
+| `BetaDownloadsView` | Offline browser, 4 sub-tabs (Artists/Albums/Songs/Genres) grouped by denormalized metadata; active-download progress; offline playback; Shuffle at each level; value-based drill-down. | Empty: "No downloads yet". |
 | `DownloadedArtistView` / `DownloadedAlbumView` | One artist's / one album's completed downloads in album order; Play All; per-item play. | Missing-file handling via `DownloadedPlayback.StartFailure`. |
+| `DownloadedGenreView` | One genre's completed downloads as a flat song list (mirrors `GenreTrackListView`, not the album-grouped artist/album views); Shuffle All; per-item play. | Missing-file handling via `DownloadedPlayback.StartFailure`. Empty: "No downloads". |
 | `BetaDownloadButton` / `BetaAlbumDownloadButton` | Per-track and per-album bulk download/remove with a progress ring. | — |
 | `OfflineGate` | Shared offline-detection modifier (see §4.1). | "You're offline" + Go to Downloads / Retry. |
 | `JellyfinImage` | Loads from local disk (cached artwork), remote server, or SF Symbol placeholder. | — |

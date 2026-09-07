@@ -16,6 +16,7 @@ import SwiftUI
 enum DownloadsRoute: Hashable {
     case artist(name: String)
     case album(id: String, name: String, artist: String)
+    case genre(name: String)
 }
 
 extension View {
@@ -33,6 +34,8 @@ extension View {
                     artistName: artist,
                     serverURL: serverURL
                 )
+            case .genre(let name):
+                DownloadedGenreView(genreName: name, serverURL: serverURL)
             }
         }
     }

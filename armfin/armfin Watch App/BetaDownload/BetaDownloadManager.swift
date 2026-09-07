@@ -15,6 +15,10 @@ struct TrackInfo: Sendable {
     /// because not every source is tagged with them.
     var indexNumber: Int? = nil
     var discNumber: Int? = nil
+    /// First genre tag, if any. Denormalized onto `BetaDownloadItem` the same
+    /// way `artistName`/`albumName` already are, so the offline Genres tab
+    /// can group completed downloads without touching the server.
+    var genreName: String = ""
 }
 
 enum AlbumDownloadState {
@@ -279,7 +283,8 @@ final class BetaDownloadManager: NSObject {
             indexNumber: track.indexNumber,
             discNumber: track.discNumber,
             status: .queued,
-            durationTicks: track.durationTicks
+            durationTicks: track.durationTicks,
+            genreName: track.genreName
         )
         modelContext.insert(item)
         try? modelContext.save()
@@ -404,7 +409,8 @@ final class BetaDownloadManager: NSObject {
                 albumId: track.albumId ?? albumId,
                 durationTicks: track.durationTicks,
                 indexNumber: track.indexNumber,
-                discNumber: track.discNumber
+                discNumber: track.discNumber,
+                genreName: track.genreName ?? ""
             ))
         }
     }

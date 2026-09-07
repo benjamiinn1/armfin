@@ -132,7 +132,8 @@ struct AlbumListView: View {
                             maxWidth: 200,
                             maxHeight: 200,
                             tag: t.imageTag
-                        )
+                        ),
+                        genreName: t.genreName
                     ))
                 }
             }
@@ -153,7 +154,8 @@ struct AlbumListView: View {
                 albumName: item.albumName,
                 albumId: item.albumId,
                 durationSeconds: item.durationSeconds,
-                artworkURL: item.artworkURL
+                artworkURL: item.artworkURL,
+                genreName: item.genreName
             ))
         }
         playbackEngine.play(
@@ -168,7 +170,8 @@ struct AlbumListView: View {
             albumName: firstItem.albumName,
             albumId: firstItem.albumId,
             durationSeconds: firstItem.durationSeconds,
-            artworkURL: firstItem.artworkURL
+            artworkURL: firstItem.artworkURL,
+            genreName: firstItem.genreName
         ))
         showNowPlaying()
     }

@@ -11,7 +11,9 @@ private let appLog = Logger(subsystem: "com.armfin", category: "App")
 /// precondition trap that cannot be caught with do/catch.
 /// 6: `BetaDownloadItem` gained `indexNumber`/`discNumber` so downloaded
 ///    albums can list in real album order offline.
-private let currentSchemaVersion = 6
+/// 7: `BetaDownloadItem` gained `genreName` so downloaded songs can be
+///    browsed/grouped by genre offline, mirroring the online Genres tab.
+private let currentSchemaVersion = 7
 
 @main
 struct ArmfinApp: App {

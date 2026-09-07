@@ -251,6 +251,38 @@ struct JellyfinAPIClient: Sendable {
         let artistName: String?
     }
 
+    /// Wire-format decode of a single `Genre` item from `/Genres`. Jellyfin's
+    /// `Genre` items carry `Id`, `Name`, and (on recent servers) a
+    /// `SortName`/`PrimaryImageTag` pair in the same shape as artists and
+    /// albums. `SortName` and the image tag are decoded as optional so a
+    /// server that omits them (older builds only guarantee `Id`/`Name`) still
+    /// decodes cleanly.
+    private struct GenrePayload: Decodable {
+        let id: String
+        let name: String
+        let sortName: String?
+        let primaryImageTag: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id = "Id"
+            case name = "Name"
+            case sortName = "SortName"
+            case primaryImageTag = "PrimaryImageTag"
+        }
+    }
+
+    /// Public result of a single `/Genres` call, decoupled from the private
+    /// wire-format struct above the same way `ArtistSummary` decouples from
+    /// `ArtistPayload`. `id` is the genre's `Id`, used both as the row's
+    /// identity and as the `GenreIds` filter value for the songs-in-genre
+    /// fetch (`fetchGenreTracks`).
+    struct GenreSummary: Decodable, Equatable, Sendable {
+        let id: String
+        let name: String
+        let sortName: String
+        let imageTag: String?
+    }
+
     /// Wire-format decode of a single `Audio` item from `/Items`. Mirrors
     /// `CachedTrack`'s wire-relevant fields (specs/spec.md §1.4):
     /// `ParentIndexNumber` is the disc number, `IndexNumber` the track
@@ -270,6 +302,7 @@ struct JellyfinAPIClient: Sendable {
         let album: String?
         let albumId: String?
         let imageTags: ArtistPayload.ImageTags?
+        let genres: [String]?
 
         struct MediaSourcePayload: Decodable {
             let bitrate: Int?
@@ -291,6 +324,7 @@ struct JellyfinAPIClient: Sendable {
             case album = "Album"
             case albumId = "AlbumId"
             case imageTags = "ImageTags"
+            case genres = "Genres"
         }
     }
 
@@ -311,6 +345,14 @@ struct JellyfinAPIClient: Sendable {
         let albumName: String?
         let albumId: String?
         let imageTag: String?
+
+        /// First of Jellyfin's `Genres` array, the same "denormalize to one
+        /// primary value" convention `artistName`/`albumName` already use
+        /// here (`AlbumSummary.artistName` does the same via `albumArtist ??
+        /// artists?.first`). A track can carry more than one genre tag; this
+        /// is best-effort metadata for offline grouping
+        /// (`BetaDownloadItem.genreName`), not a full multi-genre model.
+        let genreName: String?
     }
 
     // MARK: - Construction
@@ -664,7 +706,13 @@ struct JellyfinAPIClient: Sendable {
             URLQueryItem(name: "SortBy", value: "ParentIndexNumber,IndexNumber"),
             URLQueryItem(name: "userId", value: userId),
             URLQueryItem(name: "StartIndex", value: String(startIndex)),
-            URLQueryItem(name: "Limit", value: String(limit))
+            URLQueryItem(name: "Limit", value: String(limit)),
+            // Jellyfin's default BaseItemDto for /Items omits several
+            // descriptive array fields (Genres among them) unless the
+            // caller lists them here — without this, payload.genres always
+            // decodes nil and every download shows as "Unknown Genre"
+            // offline regardless of what the server has tagged.
+            URLQueryItem(name: "Fields", value: "Genres")
         ]
 
         guard let finalURL = components?.url else {
@@ -690,7 +738,8 @@ struct JellyfinAPIClient: Sendable {
                 artistName: payload.albumArtist,
                 albumName: payload.album,
                 albumId: payload.albumId,
-                imageTag: payload.imageTags?.primary
+                imageTag: payload.imageTags?.primary,
+                genreName: payload.genres?.first
             )
         }
 
@@ -775,7 +824,9 @@ struct JellyfinAPIClient: Sendable {
             URLQueryItem(name: "SortBy", value: "SortName"),
             URLQueryItem(name: "userId", value: userId),
             URLQueryItem(name: "StartIndex", value: String(startIndex)),
-            URLQueryItem(name: "Limit", value: String(limit))
+            URLQueryItem(name: "Limit", value: String(limit)),
+            // See fetchTracks: Genres isn't in Jellyfin's default field set.
+            URLQueryItem(name: "Fields", value: "Genres")
         ]
 
         guard let finalURL = components?.url else {
@@ -801,7 +852,140 @@ struct JellyfinAPIClient: Sendable {
                 artistName: payload.albumArtist,
                 albumName: payload.album,
                 albumId: payload.albumId,
-                imageTag: payload.imageTags?.primary
+                imageTag: payload.imageTags?.primary,
+                genreName: payload.genres?.first
+            )
+        }
+
+        return PagedResult(
+            items: items,
+            totalRecordCount: response.totalRecordCount,
+            startIndex: response.startIndex
+        )
+    }
+
+    // MARK: - Genres
+
+    /// Performs `GET {serverURL}/Genres` with `IncludeItemTypes=Audio`,
+    /// `ParentId=<musicLibraryId>`, `Recursive=true`, `SortBy=SortName`,
+    /// `SortOrder=Ascending`, and `userId=<userId>` (§2.1, §2.3), returning a
+    /// paged result of decoded `GenreSummary` values across the entire music
+    /// library.
+    ///
+    /// Uses the dedicated `/Genres` endpoint (not `/Items?IncludeItemTypes=`)
+    /// for the same reason `fetchArtists` prefers `/Artists` over the raw
+    /// `/Items` form: `/Genres` collapses duplicate genre rows server-side so
+    /// the same genre name is never shown twice, which a recursive `/Items`
+    /// query cannot guarantee. Same `BaseItemDtoQueryResult` response shape,
+    /// so pagination/decoding are unchanged.
+    func fetchGenres(
+        serverURL: String,
+        userId: String,
+        accessToken: String,
+        musicLibraryId: String,
+        startIndex: Int = 0,
+        limit: Int = 50
+    ) async throws -> PagedResult<GenreSummary> {
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Genres")
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "IncludeItemTypes", value: "Audio"),
+            URLQueryItem(name: "ParentId", value: musicLibraryId),
+            URLQueryItem(name: "Recursive", value: "true"),
+            URLQueryItem(name: "SortBy", value: "SortName"),
+            URLQueryItem(name: "SortOrder", value: "Ascending"),
+            URLQueryItem(name: "userId", value: userId),
+            URLQueryItem(name: "StartIndex", value: String(startIndex)),
+            URLQueryItem(name: "Limit", value: String(limit))
+        ]
+
+        guard let finalURL = components?.url else {
+            throw JellyfinAPIClientError.invalidURL
+        }
+
+        var request = URLRequest(url: finalURL)
+        request.httpMethod = "GET"
+        applyCommonHeaders(to: &request, accessToken: accessToken)
+
+        let data = try await perform(request)
+        let response = try decode(ItemsResponse<GenrePayload>.self, from: data)
+
+        let items = response.items.map { payload in
+            GenreSummary(
+                id: payload.id,
+                name: payload.name,
+                sortName: payload.sortName ?? payload.name,
+                imageTag: payload.primaryImageTag
+            )
+        }
+
+        return PagedResult(
+            items: items,
+            totalRecordCount: response.totalRecordCount,
+            startIndex: response.startIndex
+        )
+    }
+
+    /// Performs `GET {serverURL}/Items` with `IncludeItemTypes=Audio`,
+    /// `GenreIds=<genreId>`, `Recursive=true`, `ParentId=<musicLibraryId>`,
+    /// `SortBy=SortName`, and `userId=<userId>` (§2.1, §2.3), returning a
+    /// paged result of decoded `TrackSummary` values for a single genre.
+    ///
+    /// `GenreIds` is the server-side filter that scopes the query to the
+    /// songs tagged with the given genre's `Id`; `ParentId`+`Recursive` keep
+    /// the search inside the music library, mirroring how `fetchAllTracks`
+    /// scopes the Songs tab.
+    func fetchGenreTracks(
+        serverURL: String,
+        userId: String,
+        accessToken: String,
+        musicLibraryId: String,
+        genreId: String,
+        startIndex: Int = 0,
+        limit: Int = 50
+    ) async throws -> PagedResult<TrackSummary> {
+        let url = try Self.endpointURL(serverURL: serverURL, path: "/Items")
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "IncludeItemTypes", value: "Audio"),
+            URLQueryItem(name: "GenreIds", value: genreId),
+            URLQueryItem(name: "Recursive", value: "true"),
+            URLQueryItem(name: "ParentId", value: musicLibraryId),
+            URLQueryItem(name: "SortBy", value: "SortName"),
+            URLQueryItem(name: "userId", value: userId),
+            URLQueryItem(name: "StartIndex", value: String(startIndex)),
+            URLQueryItem(name: "Limit", value: String(limit)),
+            // Not load-bearing here (GenreTrackListView downloads use the
+            // screen's own genre, not payload.genres), kept for parity with
+            // fetchTracks/fetchAllTracks and any future caller that reads it.
+            URLQueryItem(name: "Fields", value: "Genres")
+        ]
+
+        guard let finalURL = components?.url else {
+            throw JellyfinAPIClientError.invalidURL
+        }
+
+        var request = URLRequest(url: finalURL)
+        request.httpMethod = "GET"
+        applyCommonHeaders(to: &request, accessToken: accessToken)
+
+        let data = try await perform(request)
+        let response = try decode(ItemsResponse<TrackPayload>.self, from: data)
+
+        let items = response.items.map { payload in
+            TrackSummary(
+                id: payload.id,
+                name: payload.name,
+                indexNumber: payload.indexNumber,
+                discNumber: payload.parentIndexNumber,
+                durationTicks: payload.runTimeTicks ?? 0,
+                container: payload.container,
+                bitrate: payload.mediaSources?.first?.bitrate,
+                artistName: payload.albumArtist,
+                albumName: payload.album,
+                albumId: payload.albumId,
+                imageTag: payload.imageTags?.primary,
+                genreName: payload.genres?.first
             )
         }
 

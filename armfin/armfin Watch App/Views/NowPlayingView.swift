@@ -320,7 +320,8 @@ struct NowPlayingView: View {
             albumId: track.albumId ?? "",
             durationTicks: Int64(track.durationSeconds * 10_000_000),
             indexNumber: track.indexNumber,
-            discNumber: track.discNumber
+            discNumber: track.discNumber,
+            genreName: track.genreName ?? ""
         ))
     }
 
