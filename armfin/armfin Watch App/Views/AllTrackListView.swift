@@ -3,19 +3,30 @@ import SwiftData
 
 struct AllTrackListView: View {
     @State private var viewModel: AllTracksViewModel
+    @Binding private var selectedCategory: LibraryCategory
+    private let shuffleAction: (() -> Void)?
 
     @Environment(\.playbackEngine) private var playbackEngine
     @Environment(\.nowPlayingManager) private var nowPlayingManager
     @Environment(\.showNowPlaying) private var showNowPlaying
+    @Environment(\.networkStatusService) private var networkStatusService
 
     private let serverURL: String
     private let userId: String
     private let accessToken: String
 
-    init(serverURL: String, userId: String, accessToken: String) {
+    init(
+        serverURL: String,
+        userId: String,
+        accessToken: String,
+        selectedCategory: Binding<LibraryCategory>,
+        shuffleAction: (() -> Void)?
+    ) {
         self.serverURL = serverURL
         self.userId = userId
         self.accessToken = accessToken
+        self._selectedCategory = selectedCategory
+        self.shuffleAction = shuffleAction
         _viewModel = State(
             wrappedValue: AllTracksViewModel(
                 serverURL: serverURL,
@@ -25,34 +36,42 @@ struct AllTrackListView: View {
         )
     }
 
+    /// See `ArtistListView.body` — the header is always the first two rows
+    /// of this list so it lines up exactly with every other browse screen.
     var body: some View {
-        Group {
-            switch viewModel.state {
-            case .idle, .loading:
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .loaded where viewModel.tracks.isEmpty:
-                emptyState
-            case .loaded:
-                trackList
-            case .failed(let error):
-                errorState(error)
-            }
+        List {
+            LibraryBrowseHeaderRows(
+                selection: $selectedCategory,
+                shuffleAction: shuffleAction,
+                statusLabel: networkStatusService.isOffline ? "Offline" : "Connected"
+            )
+
+            content
+                .offlineGate(
+                    tabKey: "all-tracks",
+                    isUnreachable: viewModel.state == .failed(.serverUnreachable),
+                    isLoaded: viewModel.state == .loaded,
+                    showsStatusText: false,
+                    onRetry: { await viewModel.load() }
+                )
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
         .background(.black)
-        .offlineGate(
-            tabKey: "all-tracks",
-            isUnreachable: viewModel.state == .failed(.serverUnreachable),
-            isLoaded: viewModel.state == .loaded,
-            onRetry: { await viewModel.load() }
-        )
+        .environment(\.defaultMinListRowHeight, 16)
     }
 
-    private var trackList: some View {
-        List {
-            shuffleButton
+    @ViewBuilder
+    private var content: some View {
+        switch viewModel.state {
+        case .idle, .loading:
+            ProgressView()
+                .frame(maxWidth: .infinity)
                 .listRowBackground(Color.clear)
-
+        case .loaded where viewModel.tracks.isEmpty:
+            emptyState
+                .listRowBackground(Color.clear)
+        case .loaded:
             ForEach(viewModel.tracks, id: \.id) { track in
                 trackRow(track)
                     .listRowBackground(Color.clear)
@@ -63,27 +82,10 @@ struct AllTrackListView: View {
                     await viewModel.loadMore()
                 }
             }
+        case .failed(let error):
+            errorState(error)
+                .listRowBackground(Color.clear)
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .background(.black)
-    }
-
-    private var shuffleButton: some View {
-        Button {
-            shuffleAll()
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "shuffle")
-                    .font(.footnote)
-                    .foregroundStyle(.blue)
-                Text("Shuffle All")
-                    .font(.footnote)
-                    .foregroundStyle(.blue)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .buttonStyle(.plain)
     }
 
     private func trackRow(_ track: JellyfinAPIClient.TrackSummary) -> some View {
@@ -168,11 +170,6 @@ struct AllTrackListView: View {
         showNowPlaying()
     }
 
-    private func shuffleAll() {
-        guard !viewModel.tracks.isEmpty, let first = viewModel.tracks.randomElement() else { return }
-        playTrack(first, shuffle: true)
-    }
-
     private func betaDownloadButton(for track: JellyfinAPIClient.TrackSummary) -> some View {
         BetaDownloadButton(jellyfinId: track.id) {
             BetaDownloadManager.shared.download(track: TrackInfo(
@@ -243,7 +240,13 @@ struct AllTrackListView: View {
 
 #Preview {
     NavigationStack {
-        AllTrackListView(serverURL: "https://example.com", userId: "user-id", accessToken: "token")
+        AllTrackListView(
+            serverURL: "https://example.com",
+            userId: "user-id",
+            accessToken: "token",
+            selectedCategory: .constant(.songs),
+            shuffleAction: nil
+        )
     }
     .modelContainer(for: [BetaDownloadItem.self], inMemory: true)
 }

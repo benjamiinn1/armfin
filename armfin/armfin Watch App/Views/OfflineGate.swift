@@ -34,6 +34,14 @@ struct OfflineGate: ViewModifier {
     /// Calls the real fetch again — `viewModel.load()` at the call site.
     let onRetry: () async -> Void
 
+    /// `false` when the caller already surfaces connectivity status of its
+    /// own — the Library browse tabs' "Connected"/"Offline" status label —
+    /// so the offline icon and explanation text aren't repeated; only the
+    /// two actions show. `true` (the default) for the drill-down screens
+    /// (`AlbumListView`, `TrackListView`, `GenreTrackListView`), which have
+    /// no such label and still need the full explanation.
+    var showsStatusText: Bool = true
+
     @Environment(\.networkStatusService) private var networkStatusService
     @Environment(\.showDownloads) private var showDownloads
 
@@ -77,42 +85,63 @@ struct OfflineGate: ViewModifier {
         }
     }
 
+    /// Compact by necessity: this renders below the category picker bar, so
+    /// it only has what's left of a watch screen after the clock and that
+    /// bar. Two short lines instead of a full sentence, and the two actions
+    /// side by side instead of stacked — stacked 44pt buttons plus a
+    /// multi-line sentence didn't fit and forced the system to compress and
+    /// overlap them (the bug this replaces).
     private var offlineState: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "wifi.slash")
-                .font(.title3)
-                .foregroundStyle(.white.opacity(0.4))
-            Text("You're offline")
-                .font(.footnote)
-                .foregroundStyle(.white.opacity(0.7))
-            Text("Your Jellyfin server can't be reached right now.")
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.4))
-                .multilineTextAlignment(.center)
-
-            Button {
-                showDownloads()
-            } label: {
-                Text("Go to Downloads")
-                    .font(.caption)
+        VStack(spacing: 4) {
+            if showsStatusText {
+                Image(systemName: "wifi.slash")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.4))
+                Text("Offline")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.7))
+                Text("Can't reach server")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.4))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
-            .buttonStyle(.bordered)
-            .tint(.blue)
-            .frame(minHeight: 44)
 
-            Button {
-                networkStatusService.clearFailed(tabKey: tabKey)
-                Task { await onRetry() }
-            } label: {
-                Text("Retry")
-                    .font(.caption)
+            HStack(spacing: 6) {
+                Button {
+                    showDownloads()
+                } label: {
+                    Text("Downloads")
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                .buttonStyle(.bordered)
+                .tint(.blue)
+                .frame(minHeight: 44)
+
+                Button {
+                    networkStatusService.clearFailed(tabKey: tabKey)
+                    Task { await onRetry() }
+                } label: {
+                    Text("Retry")
+                        .font(.caption2)
+                }
+                .buttonStyle(.bordered)
+                .frame(minHeight: 44)
             }
-            .buttonStyle(.bordered)
-            .frame(minHeight: 44)
+            .padding(.top, showsStatusText ? 4 : 0)
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.black)
+        // Harmless where this renders full-screen (the drill-down screens
+        // that apply `.offlineGate` at the top of their `body`); needed
+        // where it renders as List row content instead (the four Library
+        // browse tabs, so the shared header above it stays put) — without
+        // it the row falls back to the List's default row background
+        // instead of blending into the screen's black.
+        .listRowBackground(Color.clear)
     }
 }
 
@@ -127,13 +156,15 @@ extension View {
         tabKey: String,
         isUnreachable: Bool,
         isLoaded: Bool,
+        showsStatusText: Bool = true,
         onRetry: @escaping () async -> Void
     ) -> some View {
         modifier(OfflineGate(
             tabKey: tabKey,
             isUnreachable: isUnreachable,
             isLoaded: isLoaded,
-            onRetry: onRetry
+            onRetry: onRetry,
+            showsStatusText: showsStatusText
         ))
     }
 }
