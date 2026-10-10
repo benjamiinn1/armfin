@@ -4,7 +4,7 @@
 //
 //  Services-layer foreground JSON API client, per specs/spec.md §1.5(1).
 //  Owns a single `URLSession(configuration: .default)` instance, header
-//  construction (`X-Emby-Authorization`), and JSON decoding for the
+//  construction (`Authorization`), and JSON decoding for the
 //  Jellyfin calls implemented so far: pre-auth server validation
 //  (`GET /System/Info/Public`), login (`POST /Users/AuthenticateByName`),
 //  music library discovery (`GET /Users/{UserId}/Views`), artist listing,
@@ -359,7 +359,7 @@ struct JellyfinAPIClient: Sendable {
 
     private let session: URLSession
 
-    /// `DeviceId`/`Version` for the `X-Emby-Authorization` header (§2.2).
+    /// `DeviceId`/`Version` for the `Authorization` header (§2.2).
     private let deviceId: String
     private let appVersion: String
 
@@ -1090,7 +1090,7 @@ struct JellyfinAPIClient: Sendable {
             URLQueryItem(name: "maxStreamingBitrate", value: String(Self.streamingBitrate)),
             URLQueryItem(name: "audioBitRate", value: String(Self.streamingBitrate)),
             URLQueryItem(name: "maxAudioChannels", value: "2"),
-            URLQueryItem(name: "api_key", value: accessToken)
+            URLQueryItem(name: "ApiKey", value: accessToken)
         ]
 
         if preferDirectPlay {
@@ -1158,7 +1158,7 @@ struct JellyfinAPIClient: Sendable {
             URLQueryItem(name: "maxStreamingBitrate", value: String(transcodeBitrateBitsPerSecond)),
             URLQueryItem(name: "maxAudioChannels", value: "2"),
             URLQueryItem(name: "static", value: "false"),
-            URLQueryItem(name: "api_key", value: accessToken)
+            URLQueryItem(name: "ApiKey", value: accessToken)
         ]
 
         return components?.url
@@ -1183,16 +1183,21 @@ struct JellyfinAPIClient: Sendable {
         return base.appendingPathComponent(String(path.dropFirst(path.hasPrefix("/") ? 1 : 0)))
     }
 
-    /// Sets the `X-Emby-Authorization` header on every outgoing request per
-    /// §2.2's exact format. Once authenticated, appends `, Token="<token>"` as
-    /// the spec allows, rather than relying solely on a separate `X-Emby-Token`
+    /// Sets the `Authorization` header on every outgoing request per §2.2's
+    /// exact format. Once authenticated, appends `, Token="<token>"` as the
+    /// spec allows, rather than relying solely on a separate `X-Emby-Token`
     /// header.
+    ///
+    /// Note: must be the standard `Authorization` header — Jellyfin ≥ 12
+    /// only reads the legacy `X-Emby-Authorization` header when the server
+    /// has "Enable legacy authorization" enabled, and without a parsed
+    /// client name it 500s on `/Users/AuthenticateByName`.
     private func applyCommonHeaders(to request: inout URLRequest, accessToken: String?) {
         var headerValue = "MediaBrowser Client=\"armfin\", Device=\"Apple Watch\", DeviceId=\"\(deviceId)\", Version=\"\(appVersion)\""
         if let accessToken {
             headerValue += ", Token=\"\(accessToken)\""
         }
-        request.setValue(headerValue, forHTTPHeaderField: "X-Emby-Authorization")
+        request.setValue(headerValue, forHTTPHeaderField: "Authorization")
     }
 
     /// Executes `request`, mapping transport failures and non-2xx responses to

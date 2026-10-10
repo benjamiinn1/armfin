@@ -355,7 +355,7 @@ Notes on the download model:
 
 Two deliberately separate `URLSession` stacks — they cannot be merged because background sessions disallow completion-handler convenience APIs and cannot be ephemeral, while the foreground client wants async/await ergonomics and per-request cancellation:
 
-1. **Foreground JSON API client** (`JellyfinAPIClient`) — `URLSession(configuration: .default)`, a `Sendable` struct with a `shared` instance for views that fetch and static URL builders for views that only build URLs. Used for server validation, auth, Quick Connect, `/Items`-family browsing, and static URL construction (stream, download, image). Owns header construction (`X-Emby-Authorization`) and JSON decoding.
+1. **Foreground JSON API client** (`JellyfinAPIClient`) — `URLSession(configuration: .default)`, a `Sendable` struct with a `shared` instance for views that fetch and static URL builders for views that only build URLs. Used for server validation, auth, Quick Connect, `/Items`-family browsing, and static URL construction (stream, download, image). Owns header construction (`Authorization`) and JSON decoding.
 2. **Background download session** (`BetaDownloadManager`) — `URLSessionConfiguration.background(withIdentifier: "com.armfin.beta-downloads")`, `isDiscretionary = false`, `sessionSendsLaunchEvents = true`, `waitsForConnectivity = true`, delegate-based (`URLSessionDownloadDelegate`, no async/await). A single instance is created **eagerly at app launch** (not lazily on first download) so the delegate is always registered before the system tries to deliver events to a relaunched process.
 
 ---
@@ -376,8 +376,8 @@ Two deliberately separate `URLSession` stacks — they cannot be merged because 
 | Library-wide songs | GET | `/Items` | `IncludeItemTypes=Audio`, `Recursive=true`, `ParentId=<musicLibraryId>`, `SortBy=SortName`, `userId`, `StartIndex`, `Limit` (Songs tab) |
 | Genres | GET | `/Genres` | `IncludeItemTypes=Audio`, `ParentId=<musicLibraryId>`, `Recursive=true`, `SortBy=SortName`, `SortOrder=Ascending`, `userId`, `StartIndex`, `Limit` (Genres tab) |
 | Songs for genre | GET | `/Items` | `IncludeItemTypes=Audio`, `GenreIds=<genreId>`, `Recursive=true`, `ParentId=<musicLibraryId>`, `SortBy=SortName`, `userId`, `StartIndex`, `Limit` (genre detail) |
-| Streaming | GET | `/Audio/{Id}/universal` | `audioCodec/container/transcodingContainer=aac`, `maxStreamingBitrate=128000`, `audioBitRate=128000`, `maxAudioChannels=2`, `api_key`; add `static=true` for direct-play |
-| Background download | GET | `/Audio/{Id}/stream.aac` | `audioCodec=aac`, `audioBitRate=128000`, `maxStreamingBitrate=128000`, `maxAudioChannels=2`, `static=false`, `api_key` — a transcode, not a direct copy |
+| Streaming | GET | `/Audio/{Id}/universal` | `audioCodec/container/transcodingContainer=aac`, `maxStreamingBitrate=128000`, `audioBitRate=128000`, `maxAudioChannels=2`, `ApiKey`; add `static=true` for direct-play |
+| Background download | GET | `/Audio/{Id}/stream.aac` | `audioCodec=aac`, `audioBitRate=128000`, `maxStreamingBitrate=128000`, `maxAudioChannels=2`, `static=false`, `ApiKey` — a transcode, not a direct copy |
 | Artwork | GET | `/Items/{Id}/Images/Primary` | `maxWidth`, `maxHeight` (capped to rendered size, default 80), `quality=80`, `tag=<imageTag>` (size appropriately for the watch screen — request at 1x/2x display points, never full-resolution server art) |
 | Quick Connect: initiate | POST | `/QuickConnect/Initiate` | none, no auth (401 if disabled server-side) |
 | Quick Connect: poll | GET | `/QuickConnect/Connect` | `secret=<secret>` |
@@ -387,8 +387,15 @@ Two deliberately separate `URLSession` stacks — they cannot be merged because 
 
 Every request carries:
 ```
-X-Emby-Authorization: MediaBrowser Client="armfin", Device="Apple Watch", DeviceId="<persisted-UUID>", Version="<app version>"
+Authorization: MediaBrowser Client="armfin", Device="Apple Watch", DeviceId="<persisted-UUID>", Version="<app version>"
 ```
+
+> The header must be the standard `Authorization` header. Jellyfin ≥ 12 reads
+> the legacy `X-Emby-Authorization` header only when the server has "Enable
+> legacy authorization" enabled; without a parsed `Client` name the server
+> 500s on `/Users/AuthenticateByName` (same for Quick Connect's `DeviceId`).
+> Likewise, query-string tokens use the non-legacy `ApiKey` spelling (AVPlayer
+> streams carry no custom headers, so the query token is their only auth).
 
 Request:
 ```json
@@ -412,7 +419,7 @@ Response:
 }
 ```
 
-After authentication, append `, Token="<AccessToken>"` to the `X-Emby-Authorization` header on every subsequent call.
+After authentication, append `, Token="<AccessToken>"` to the `Authorization` header on every subsequent call.
 
 ### 2.3 Library Browsing Flow
 
